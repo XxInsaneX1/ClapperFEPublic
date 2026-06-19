@@ -1,11 +1,6 @@
 --------------------------------------------------------------------------
 -- AntiFling -- core protection + sleek black settings GUI
--- Synced version:
--- - Loads Trajectory API and stores predictor
--- - Passes predictor into AcidRedirect API
--- - AcidRedirect arc support synced
--- - AntiFling no longer fights AcidRedirect
--- - Singleton cleanup prevents duplicate GUIs/loops
+-- Synced with AcidRedirect + Trajectory API
 --------------------------------------------------------------------------
 
 local Players = game:GetService("Players")
@@ -27,10 +22,6 @@ local MainConnections = {}
 
 local TRAJECTORY_API_URL = "https://raw.githubusercontent.com/XxInsaneX1/ClapperFEPublic/refs/heads/main/TJFPublicRelease"
 local ACID_REDIRECT_API_URL = "https://raw.githubusercontent.com/XxInsaneX1/ClapperFEPublic/refs/heads/main/AcidRedirectAsync"
-
---------------------------------------------------------------------------
--- Live settings
---------------------------------------------------------------------------
 
 local DEFAULTS = {
 	HorizontalMultiplier = 1,
@@ -63,10 +54,6 @@ local AcidRedirect = {
 
 local EPSILON = 0.01
 
---------------------------------------------------------------------------
--- Anti-fling core
---------------------------------------------------------------------------
-
 local Character, Humanoid, RootPart
 local ragdolled = false
 local characterConnections = {}
@@ -78,11 +65,7 @@ local function isRagdollState(state)
 end
 
 local function getAcidController()
-	if AcidRedirect.Controller then
-		return AcidRedirect.Controller
-	end
-
-	return global.__AcidRedirectController
+	return AcidRedirect.Controller or global.__AcidRedirectController
 end
 
 local function isAcidRedirecting()
@@ -139,7 +122,7 @@ local function clampVelocity()
 	local maxHorizontal = Humanoid.WalkSpeed * Settings.HorizontalMultiplier
 
 	if redirectingFromAcid then
-		maxHorizontal = math.max(maxHorizontal, 80)
+		maxHorizontal = math.max(maxHorizontal, 100)
 	end
 
 	local newHorizontal = horizontal
@@ -157,7 +140,7 @@ local function clampVelocity()
 
 	if ragdolled then
 		if redirectingFromAcid then
-			maxUpward = math.max(maxUpward, 22)
+			maxUpward = math.max(maxUpward, 36)
 		else
 			maxUpward = math.min(maxUpward, Settings.RagdollMaxUpward)
 		end
@@ -223,10 +206,6 @@ end
 
 table.insert(MainConnections, LocalPlayer.CharacterAdded:Connect(setupCharacter))
 table.insert(MainConnections, RunService.Heartbeat:Connect(clampVelocity))
-
---------------------------------------------------------------------------
--- GUI setup
---------------------------------------------------------------------------
 
 local COLOR_BG = Color3.fromRGB(14, 14, 16)
 local COLOR_PANEL = Color3.fromRGB(18, 18, 21)
@@ -354,10 +333,6 @@ local function notify(titleText, bodyText, duration)
 	end)
 end
 
---------------------------------------------------------------------------
--- Button + panel
---------------------------------------------------------------------------
-
 local toggleButton = create("TextButton", {
 	Name = "ToggleButton",
 	Parent = gui,
@@ -445,10 +420,6 @@ local body = create("Frame", {
 	BackgroundTransparency = 1,
 })
 
---------------------------------------------------------------------------
--- Toggle component
---------------------------------------------------------------------------
-
 local function createToggle(parent, initial, onChanged)
 	local track = create("Frame", {
 		Parent = parent,
@@ -511,10 +482,6 @@ end)
 
 masterToggle.AnchorPoint = Vector2.new(1, 0.5)
 masterToggle.Position = UDim2.new(1, -16, 0.5, 0)
-
---------------------------------------------------------------------------
--- AcidRedirect loading
---------------------------------------------------------------------------
 
 local acidToggleSetState = nil
 local acidStatusLabel = nil
@@ -645,7 +612,7 @@ local function startAcidRedirect()
 
 		AcidRedirect.Enabled = true
 		setAcidStatus("Active", true)
-		notify("Acid-Redirect", "Already active and watching AcidPit.")
+		notify("Acid-Redirect", "Already active and watching hazards.")
 		return
 	end
 
@@ -715,9 +682,21 @@ local function startAcidRedirect()
 			PredictPlayerLanding = predictor,
 			ShowTrajectoryArc = true,
 
+			Notify = function(titleText, bodyText, duration)
+				notify(titleText, bodyText, duration)
+			end,
+
 			Config = {
 				ShowTrajectoryArc = true,
 				ClearArcWhenIdle = true,
+
+				EnableKeywordHazardDetection = true,
+				EnableBroadHazardScan = true,
+
+				EnableSlidePrediction = true,
+				EnableStandingSlidePrediction = true,
+				EnableRagdollSlidePrediction = true,
+				EnableStandingVelocitySlidePrediction = true,
 			},
 		})
 
@@ -775,13 +754,9 @@ local function startAcidRedirect()
 		AcidRedirect.Controller = controller
 
 		setAcidStatus("Active", true)
-		notify("Acid-Redirect", "Active. Synced trajectory API and AcidPit redirects are running.")
+		notify("Acid-Redirect", "Active. Synced trajectory, hazard detection, and redirects are running.")
 	end)
 end
-
---------------------------------------------------------------------------
--- Loader
---------------------------------------------------------------------------
 
 local loaderContainer = create("Frame", {
 	Name = "Loader",
@@ -838,10 +813,6 @@ local function stopSpin()
 		spinTween = nil
 	end
 end
-
---------------------------------------------------------------------------
--- Content
---------------------------------------------------------------------------
 
 local contentContainer = create("Frame", {
 	Name = "Content",
@@ -1010,10 +981,6 @@ resetButton.MouseButton1Click:Connect(function()
 	notify("Anti-Fling", "Settings reset to defaults.")
 end)
 
---------------------------------------------------------------------------
--- Open / close
---------------------------------------------------------------------------
-
 local panelOpen = false
 local loaderToken = 0
 
@@ -1078,10 +1045,6 @@ toggleButton.MouseButton1Click:Connect(function()
 	end
 end)
 
---------------------------------------------------------------------------
--- Drag panel
---------------------------------------------------------------------------
-
 local dragging = false
 local dragInput = nil
 local dragStart = nil
@@ -1120,10 +1083,6 @@ table.insert(MainConnections, UserInputService.InputChanged:Connect(function(inp
 	end
 end))
 
---------------------------------------------------------------------------
--- Singleton destroy
---------------------------------------------------------------------------
-
 global.__AntiFlingGuiController = {
 	Destroy = function()
 		pcall(stopAcidRedirect)
@@ -1146,4 +1105,4 @@ global.__AntiFlingGuiController = {
 }
 
 notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready.")
-print("[AntiFling] Loaded with synced Acid-Redirect GUI. UPD: 6:29 PM")
+print("[AntiFling] Loaded with synced Acid-Redirect GUI UPDATE: 6:36 PM")

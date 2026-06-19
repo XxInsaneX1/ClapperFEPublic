@@ -1146,4 +1146,4 @@ global.__AntiFlingGuiController = {
 }
 
 notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready.")
-print("[AntiFling] Loaded with synced Acid-Redirect GUI. UPD: 6:23 PM")
+print("[AntiFling] Loaded with synced Acid-Redirect GUI. UPD: 6:29 PM")

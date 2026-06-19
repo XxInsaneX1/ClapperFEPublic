@@ -1,5 +1,8 @@
--- Trajectory Finder API
+-- Trajectory Finder API v2
+-- Solid path tracer + ragdoll-aware 1-2 path visualization.
+--
 -- Returns PredictPlayerLanding(playerObjectOrCharacter, options)
+--
 -- Usage:
 -- local PredictPlayerLanding = loadstring(game:HttpGet(URL))()
 -- local trajectory, hitPart, hitResult, data = PredictPlayerLanding(Players.LocalPlayer, options)
@@ -8,30 +11,35 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
 --------------------------------------------------------------------------
--- TRAJECTORY ARC VISUALIZER SETTINGS
+-- TOP-LEVEL VISUAL TOGGLES
 --------------------------------------------------------------------------
 
-local SHOW_TRAJECTORY_ARC = true -- toggle this true/false
+local SHOW_TRAJECTORY_ARC = true
 
+-- Solid line tracer, no dotted path.
 local ARC_FOLDER_NAME = "__TrajectoryArcVisuals"
-local ARC_COLOR = Color3.fromRGB(0, 255, 180)
-local ARC_HIT_COLOR = Color3.fromRGB(255, 80, 80)
-local ARC_POINT_COLOR = Color3.fromRGB(255, 255, 255)
+local ARC_CLEAR_EACH_PREDICTION = true
+
+local ARC_PRIMARY_COLOR = Color3.fromRGB(0, 255, 180)
+local ARC_SECONDARY_COLOR = Color3.fromRGB(255, 190, 60)
+local ARC_HIT_COLOR = Color3.fromRGB(255, 70, 70)
+local ARC_END_MARKER_COLOR = Color3.fromRGB(255, 0, 0)
 
 local ARC_THICKNESS = 0.12
-local ARC_POINT_SIZE = 0.32
-local ARC_LANDING_MARKER_SIZE = 0.85
-
-local ARC_TRANSPARENCY = 0.15
+local ARC_TRANSPARENCY = 0.08
 local ARC_MATERIAL = Enum.Material.Neon
+local ARC_END_MARKER_SIZE = 0.85
 
--- Higher number = fewer visual parts.
--- 1 = smoothest but more parts.
--- 2 or 3 = better performance.
-local ARC_VISUAL_STRIDE = 2
+-- 1 = smoothest connected line.
+-- 2/3 = fewer parts, better performance.
+local ARC_VISUAL_STRIDE = 1
 
--- If true, old arc is deleted every time a new prediction is made.
-local CLEAR_OLD_ARC_EACH_PREDICTION = true
+-- Ragdoll visual behavior:
+-- When ragdolled, draw only 1 or 2 plausible solid paths.
+local RAGDOLL_DRAW_EXTRA_PATH = true
+local RAGDOLL_MAX_VISUAL_PATHS = 2
+local RAGDOLL_SIDE_VELOCITY = 18
+local RAGDOLL_FORWARD_BLEND = 0.35
 
 --------------------------------------------------------------------------
 
@@ -48,7 +56,8 @@ local DEFAULT_OPTIONS = {
 	MagnusCoefficient = 0.006,
 	MaxMagnusAcceleration = 80,
 
-	-- "Block" is best for characters. Use "Sphere" or "Ray" if needed.
+	-- "Block" is best for normal characters.
+	-- "Sphere" is often better for ragdoll/acid redirect checks.
 	CastMode = "Block",
 	CastPadding = 0.05,
 	IgnoreWater = true,
@@ -57,141 +66,20 @@ local DEFAULT_OPTIONS = {
 	Mass = nil,
 	CastSize = nil,
 	CastRadius = nil,
+
+	-- Visual options.
+	DrawArc = nil,
+	ClearArc = nil,
+	ArcVisualStride = nil,
+	ArcThickness = nil,
+	ArcTransparency = nil,
+
+	-- Ragdoll visual options.
+	RagdollExtraPath = nil,
+	RagdollMaxVisualPaths = nil,
+	RagdollSideVelocity = nil,
+	RagdollForwardBlend = nil,
 }
-
-local function getArcFolder()
-	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
-
-	if not folder then
-		folder = Instance.new("Folder")
-		folder.Name = ARC_FOLDER_NAME
-		folder.Parent = Workspace
-	end
-
-	return folder
-end
-
-local function clearArcFolder()
-	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
-
-	if not folder then
-		return
-	end
-
-	for _, child in ipairs(folder:GetChildren()) do
-		child:Destroy()
-	end
-end
-
-local function makeArcPart(name, size, color, transparency)
-	local part = Instance.new("Part")
-	part.Name = name
-	part.Anchored = true
-	part.CanCollide = false
-	part.CanTouch = false
-	part.CanQuery = false
-	part.CastShadow = false
-	part.Material = ARC_MATERIAL
-	part.Color = color
-	part.Transparency = transparency
-	part.Size = size
-	part.TopSurface = Enum.SurfaceType.Smooth
-	part.BottomSurface = Enum.SurfaceType.Smooth
-
-	return part
-end
-
-local function getCylinderCFrameBetween(a, b)
-	local midpoint = (a + b) * 0.5
-	local direction = b - a
-	local up = direction.Unit
-
-	local right = up:Cross(Vector3.new(0, 0, 1))
-
-	if right.Magnitude <= 0.001 then
-		right = up:Cross(Vector3.new(1, 0, 0))
-	end
-
-	right = right.Unit
-
-	local back = right:Cross(up).Unit
-
-	return CFrame.fromMatrix(midpoint, right, up, back)
-end
-
-local function drawTrajectoryArc(prediction)
-	if not SHOW_TRAJECTORY_ARC then
-		return
-	end
-
-	if CLEAR_OLD_ARC_EACH_PREDICTION then
-		clearArcFolder()
-	end
-
-	local trajectory = prediction and prediction.Trajectory
-
-	if typeof(trajectory) ~= "table" or #trajectory <= 0 then
-		return
-	end
-
-	local folder = getArcFolder()
-	local hasHit = prediction.HitPart ~= nil or prediction.HitResult ~= nil
-	local segmentColor = hasHit and ARC_HIT_COLOR or ARC_COLOR
-
-	for index = 1, #trajectory - 1, ARC_VISUAL_STRIDE do
-		local a = trajectory[index]
-		local b = trajectory[math.min(index + ARC_VISUAL_STRIDE, #trajectory)]
-
-		if typeof(a) == "Vector3" and typeof(b) == "Vector3" then
-			local distance = (b - a).Magnitude
-
-			if distance > 0.001 then
-				local segment = makeArcPart(
-					"ArcSegment",
-					Vector3.new(ARC_THICKNESS, distance, ARC_THICKNESS),
-					segmentColor,
-					ARC_TRANSPARENCY
-				)
-
-				segment.Shape = Enum.PartType.Cylinder
-				segment.CFrame = getCylinderCFrameBetween(a, b)
-				segment.Parent = folder
-			end
-		end
-	end
-
-	for index = 1, #trajectory, math.max(ARC_VISUAL_STRIDE * 3, 1) do
-		local point = trajectory[index]
-
-		if typeof(point) == "Vector3" then
-			local dot = makeArcPart(
-				"ArcPoint",
-				Vector3.new(ARC_POINT_SIZE, ARC_POINT_SIZE, ARC_POINT_SIZE),
-				ARC_POINT_COLOR,
-				0.25
-			)
-
-			dot.Shape = Enum.PartType.Ball
-			dot.CFrame = CFrame.new(point)
-			dot.Parent = folder
-		end
-	end
-
-	local landingPosition = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
-
-	if typeof(landingPosition) == "Vector3" then
-		local marker = makeArcPart(
-			"LandingMarker",
-			Vector3.new(ARC_LANDING_MARKER_SIZE, ARC_LANDING_MARKER_SIZE, ARC_LANDING_MARKER_SIZE),
-			hasHit and ARC_HIT_COLOR or ARC_COLOR,
-			0.05
-		)
-
-		marker.Shape = Enum.PartType.Ball
-		marker.CFrame = CFrame.new(landingPosition)
-		marker.Parent = folder
-	end
-end
 
 local function isPositiveNumber(value)
 	return typeof(value) == "number" and value > 0
@@ -255,6 +143,30 @@ local function getRootPart(character)
 	return character:FindFirstChild("HumanoidRootPart")
 		or character:FindFirstChild("Torso")
 		or character:FindFirstChild("UpperTorso")
+end
+
+local function getHumanoid(character)
+	if not character then
+		return nil
+	end
+
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function isRagdollState(state)
+	return state == Enum.HumanoidStateType.Physics
+		or state == Enum.HumanoidStateType.Ragdoll
+		or state == Enum.HumanoidStateType.FallingDown
+end
+
+local function isCharacterRagdolled(character)
+	local humanoid = getHumanoid(character)
+
+	if not humanoid then
+		return false
+	end
+
+	return isRagdollState(humanoid:GetState())
 end
 
 local function getMass(rootPart, character, options)
@@ -406,31 +318,153 @@ local function castAlongPath(position, displacement, castInfo, raycastParams)
 	return Workspace:Blockcast(castCFrame, castInfo.Size, displacement, raycastParams)
 end
 
-local function returnPrediction(prediction)
-	drawTrajectoryArc(prediction)
+--------------------------------------------------------------------------
+-- Solid arc drawing
+--------------------------------------------------------------------------
 
-	return prediction.Trajectory, prediction.HitPart, prediction.HitResult, prediction
-end
+local function getArcFolder()
+	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
 
-local function PredictPlayerLanding(playerOrCharacter, options)
-	options = mergeOptions(options)
-
-	local character = getCharacterFromPlayerOrCharacter(playerOrCharacter)
-	local rootPart = getRootPart(character)
-
-	if not rootPart or not rootPart:IsA("BasePart") then
-		return returnPrediction({
-			Trajectory = {},
-			HitResult = nil,
-			HitPart = nil,
-			Reason = "No HumanoidRootPart/Torso found",
-		})
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = ARC_FOLDER_NAME
+		folder.Parent = Workspace
 	end
 
+	return folder
+end
+
+local function clearArcFolder()
+	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
+
+	if not folder then
+		return
+	end
+
+	for _, child in ipairs(folder:GetChildren()) do
+		child:Destroy()
+	end
+end
+
+local function makeArcPart(name, size, color, transparency)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Material = ARC_MATERIAL
+	part.Color = color
+	part.Transparency = transparency
+	part.Size = size
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+
+	return part
+end
+
+local function getCylinderCFrameBetween(a, b)
+	local midpoint = (a + b) * 0.5
+	local direction = b - a
+
+	if direction.Magnitude <= 0.001 then
+		return CFrame.new(midpoint)
+	end
+
+	local up = direction.Unit
+	local right = up:Cross(Vector3.new(0, 0, 1))
+
+	if right.Magnitude <= 0.001 then
+		right = up:Cross(Vector3.new(1, 0, 0))
+	end
+
+	right = right.Unit
+	local back = right:Cross(up).Unit
+
+	return CFrame.fromMatrix(midpoint, right, up, back)
+end
+
+local function drawSolidPath(prediction, color, options, namePrefix)
+	if not prediction or typeof(prediction.Trajectory) ~= "table" then
+		return
+	end
+
+	local trajectory = prediction.Trajectory
+
+	if #trajectory <= 0 then
+		return
+	end
+
+	local folder = getArcFolder()
+
+	local stride = if isPositiveNumber(options.ArcVisualStride) then options.ArcVisualStride else ARC_VISUAL_STRIDE
+	stride = math.max(math.floor(stride), 1)
+
+	local thickness = if isPositiveNumber(options.ArcThickness) then options.ArcThickness else ARC_THICKNESS
+	local transparency = if typeof(options.ArcTransparency) == "number" then options.ArcTransparency else ARC_TRANSPARENCY
+
+	for index = 1, #trajectory - 1, stride do
+		local a = trajectory[index]
+		local b = trajectory[math.min(index + stride, #trajectory)]
+
+		if typeof(a) == "Vector3" and typeof(b) == "Vector3" then
+			local distance = (b - a).Magnitude
+
+			if distance > 0.001 then
+				local segment = makeArcPart(
+					namePrefix .. "_SolidPath",
+					Vector3.new(thickness, distance, thickness),
+					color,
+					transparency
+				)
+
+				segment.Shape = Enum.PartType.Cylinder
+				segment.CFrame = getCylinderCFrameBetween(a, b)
+				segment.Parent = folder
+			end
+		end
+	end
+end
+
+local function drawEndMarker(prediction)
+	if not prediction or typeof(prediction.Trajectory) ~= "table" then
+		return
+	end
+
+	local trajectory = prediction.Trajectory
+
+	if #trajectory <= 0 then
+		return
+	end
+
+	local markerPosition = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
+
+	if typeof(markerPosition) ~= "Vector3" then
+		return
+	end
+
+	local marker = makeArcPart(
+		"EndMarker",
+		Vector3.new(ARC_END_MARKER_SIZE, ARC_END_MARKER_SIZE, ARC_END_MARKER_SIZE),
+		ARC_END_MARKER_COLOR,
+		0.02
+	)
+
+	marker.Shape = Enum.PartType.Ball
+	marker.CFrame = CFrame.new(markerPosition)
+	marker.Parent = getArcFolder()
+end
+
+--------------------------------------------------------------------------
+-- Prediction core
+--------------------------------------------------------------------------
+
+local function buildPredictionFromState(character, rootPart, options, initialVelocity, initialAngularVelocity)
 	local mass = getMass(rootPart, character, options)
 	local position = rootPart.Position
-	local velocity = rootPart.AssemblyLinearVelocity
-	local angularVelocity = rootPart.AssemblyAngularVelocity
+	local velocity = initialVelocity or rootPart.AssemblyLinearVelocity
+	local angularVelocity = initialAngularVelocity or rootPart.AssemblyAngularVelocity
 	local gravity = Vector3.new(0, -options.Gravity, 0)
 	local raycastParams = buildRaycastParams(character, options)
 	local castInfo = getCastInfo(rootPart, character, options)
@@ -456,7 +490,7 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 
 			table.insert(trajectory, hitRootPosition)
 
-			return returnPrediction({
+			return {
 				Trajectory = trajectory,
 				HitResult = hitResult,
 				HitPart = hitResult.Instance,
@@ -468,7 +502,8 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 				CastMode = castInfo.Mode,
 				CastSize = castInfo.Size,
 				CastRadius = castInfo.Radius,
-			})
+				Reason = "Hit",
+			}
 		end
 
 		position = nextPosition
@@ -478,7 +513,7 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 		table.insert(trajectory, position)
 	end
 
-	return returnPrediction({
+	return {
 		Trajectory = trajectory,
 		HitResult = nil,
 		HitPart = nil,
@@ -490,7 +525,154 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 		CastSize = castInfo.Size,
 		CastRadius = castInfo.Radius,
 		Reason = "No hit within MaxTime",
-	})
+	}
+end
+
+local function getHorizontal(vector)
+	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function getRagdollAlternateVelocity(rootPart, options)
+	local velocity = rootPart.AssemblyLinearVelocity
+	local horizontal = getHorizontal(velocity)
+	local look = getHorizontal(rootPart.CFrame.LookVector)
+
+	local baseDirection
+
+	if horizontal.Magnitude > 0.001 then
+		baseDirection = horizontal.Unit
+	elseif look.Magnitude > 0.001 then
+		baseDirection = look.Unit
+	else
+		baseDirection = Vector3.new(1, 0, 0)
+	end
+
+	local side = Vector3.new(-baseDirection.Z, 0, baseDirection.X)
+
+	if side.Magnitude <= 0.001 then
+		side = Vector3.new(1, 0, 0)
+	end
+
+	side = side.Unit
+
+	local angular = rootPart.AssemblyAngularVelocity
+
+	-- Pick ONE most likely alternate side based on spin.
+	-- This prevents messy fan/spaghetti tracers.
+	if angular.Y < 0 then
+		side = -side
+	end
+
+	local sideVelocity = if isPositiveNumber(options.RagdollSideVelocity) then options.RagdollSideVelocity else RAGDOLL_SIDE_VELOCITY
+	local forwardBlend = if typeof(options.RagdollForwardBlend) == "number" then options.RagdollForwardBlend else RAGDOLL_FORWARD_BLEND
+	forwardBlend = math.clamp(forwardBlend, 0, 1)
+
+	local alternateHorizontal = horizontal * forwardBlend + side * sideVelocity
+	return Vector3.new(alternateHorizontal.X, velocity.Y, alternateHorizontal.Z)
+end
+
+local function shouldDrawArc(options)
+	if options.DrawArc == false then
+		return false
+	end
+
+	if options.DrawArc == true then
+		return true
+	end
+
+	return SHOW_TRAJECTORY_ARC
+end
+
+local function drawPredictionVisuals(character, rootPart, options, primaryPrediction)
+	if not shouldDrawArc(options) then
+		return
+	end
+
+	local clearEachPrediction = if typeof(options.ClearArc) == "boolean" then options.ClearArc else ARC_CLEAR_EACH_PREDICTION
+
+	if clearEachPrediction then
+		clearArcFolder()
+	end
+
+	local ragdolled = isCharacterRagdolled(character)
+	local primaryColor = primaryPrediction.HitPart and ARC_HIT_COLOR or ARC_PRIMARY_COLOR
+
+	drawSolidPath(primaryPrediction, primaryColor, options, "Primary")
+	drawEndMarker(primaryPrediction)
+
+	if not ragdolled then
+		return
+	end
+
+	local drawExtra = if typeof(options.RagdollExtraPath) == "boolean" then options.RagdollExtraPath else RAGDOLL_DRAW_EXTRA_PATH
+
+	if not drawExtra then
+		return
+	end
+
+	local maxPaths = if isPositiveNumber(options.RagdollMaxVisualPaths) then options.RagdollMaxVisualPaths else RAGDOLL_MAX_VISUAL_PATHS
+	maxPaths = math.clamp(math.floor(maxPaths), 1, 2)
+
+	if maxPaths < 2 then
+		return
+	end
+
+	local alternateVelocity = getRagdollAlternateVelocity(rootPart, options)
+	local currentVelocity = rootPart.AssemblyLinearVelocity
+
+	if (alternateVelocity - currentVelocity).Magnitude <= 0.5 then
+		return
+	end
+
+	local alternatePrediction = buildPredictionFromState(
+		character,
+		rootPart,
+		options,
+		alternateVelocity,
+		rootPart.AssemblyAngularVelocity
+	)
+
+	local secondaryColor = alternatePrediction.HitPart and ARC_HIT_COLOR or ARC_SECONDARY_COLOR
+
+	drawSolidPath(alternatePrediction, secondaryColor, options, "RagdollAlt")
+end
+
+local function returnPrediction(prediction)
+	return prediction.Trajectory, prediction.HitPart, prediction.HitResult, prediction
+end
+
+local function PredictPlayerLanding(playerOrCharacter, options)
+	options = mergeOptions(options)
+
+	local character = getCharacterFromPlayerOrCharacter(playerOrCharacter)
+	local rootPart = getRootPart(character)
+
+	if not rootPart or not rootPart:IsA("BasePart") then
+		local emptyPrediction = {
+			Trajectory = {},
+			HitResult = nil,
+			HitPart = nil,
+			Reason = "No HumanoidRootPart/Torso found",
+			DrawArc = options.DrawArc,
+		}
+
+		return returnPrediction(emptyPrediction)
+	end
+
+	local primaryPrediction = buildPredictionFromState(
+		character,
+		rootPart,
+		options,
+		rootPart.AssemblyLinearVelocity,
+		rootPart.AssemblyAngularVelocity
+	)
+
+	primaryPrediction.DrawArc = options.DrawArc
+	primaryPrediction.Ragdolled = isCharacterRagdolled(character)
+
+	drawPredictionVisuals(character, rootPart, options, primaryPrediction)
+
+	return returnPrediction(primaryPrediction)
 end
 
 return PredictPlayerLanding

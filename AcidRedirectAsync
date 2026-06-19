@@ -1,13 +1,16 @@
--- AcidPit Trajectory Redirect v3
--- Synced with Trajectory Finder API + visible AcidRedirect arc.
+-- AcidPit Trajectory Redirect v4
+-- Synced with Trajectory Finder API + smooth solid AcidRedirect path tracer.
 -- Features:
 -- - Returns Controller
 -- - Cleans old controller
 -- - WaitForChild timeouts
 -- - Uses external PredictPlayerLanding API if passed from loader
 -- - Falls back to internal predictor if no external API is provided
--- - Draws visible trajectory arc when velocity/prediction activates
--- - Clears arc when idle/stopped/destroyed
+-- - Smooth solid path tracer, no dotted path
+-- - Red endpoint marker
+-- - Stronger emergency redirect when predicted to hit AcidPit
+-- - Better escape direction from large acid parts
+-- - AntiFling-compatible redirect state API
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -34,36 +37,41 @@ local CONFIG = {
 	Enabled = true,
 
 	--------------------------------------------------------------------------
-	-- Arc visualizer
+	-- Smooth path tracer
 	--------------------------------------------------------------------------
 
 	ShowTrajectoryArc = true,
 	ClearArcWhenIdle = true,
 	ArcFolderName = "__AcidRedirectTrajectoryArc",
-	ArcVisualStride = 2,
+
+	-- 1 = smoothest/most connected line.
+	-- Higher values = fewer line segments.
+	ArcVisualStride = 1,
+
 	ArcThickness = 0.12,
-	ArcPointSize = 0.3,
 	ArcLandingMarkerSize = 0.85,
+
 	ArcSafeColor = Color3.fromRGB(0, 255, 180),
 	ArcDangerColor = Color3.fromRGB(255, 70, 70),
-	ArcPointColor = Color3.fromRGB(255, 255, 255),
-	ArcTransparency = 0.15,
+	ArcEndMarkerColor = Color3.fromRGB(255, 0, 0),
+
+	ArcTransparency = 0.08,
 	ArcMaterial = Enum.Material.Neon,
 
 	--------------------------------------------------------------------------
 	-- Prediction
 	--------------------------------------------------------------------------
 
-	PredictEvery = 0.14,
-	ApplyWindow = 0.34,
+	PredictEvery = 0.12,
+	ApplyWindow = 0.38,
 	MinSpeedToPredict = 8,
 	ActivationDistance = 230,
 
 	PredictionMaxTime = 1.85,
-	PredictionTimeStep = 1 / 28,
+	PredictionTimeStep = 1 / 40,
 	CharacterRadius = 1.65,
-	TrajectoryDangerRadius = 2.75,
-	TrajectorySampleStride = 2,
+	TrajectoryDangerRadius = 2.85,
+	TrajectorySampleStride = 1,
 
 	AirDensity = 0.015,
 	DragCoefficient = 0.55,
@@ -92,12 +100,20 @@ local CONFIG = {
 	-- Redirect
 	--------------------------------------------------------------------------
 
-	RedirectResponsiveness = 8.5,
-	RedirectHorizontalSpeed = 38,
-	RedirectMaxHorizontalSpeed = 74,
-	RedirectLift = 18,
-	SlideRedirectLift = 10,
-	SideBias = 0.22,
+	RedirectResponsiveness = 16,
+	RedirectHorizontalSpeed = 48,
+	RedirectMaxHorizontalSpeed = 92,
+	RedirectLift = 26,
+	SlideRedirectLift = 16,
+	SideBias = 0.32,
+
+	EmergencyRedirectTime = 0.55,
+	EmergencyRedirectDistance = 28,
+	EmergencyRedirectAlpha = 1,
+	NormalRedirectMinAlpha = 0.35,
+
+	ImpulseAssist = true,
+	ImpulseMultiplier = 1.15,
 }
 
 if typeof(loaderOptions.ShowTrajectoryArc) == "boolean" then
@@ -160,7 +176,7 @@ local function clearArray(array)
 end
 
 --------------------------------------------------------------------------
--- Arc visualizer
+-- Smooth solid path tracer
 --------------------------------------------------------------------------
 
 local function getArcFolder()
@@ -241,10 +257,10 @@ local function drawTrajectoryArc(prediction, danger)
 	local trajectory = prediction.Trajectory
 	local folder = getArcFolder()
 	local isDanger = danger ~= nil
-
-	local arcColor = isDanger and CONFIG.ArcDangerColor or CONFIG.ArcSafeColor
+	local lineColor = isDanger and CONFIG.ArcDangerColor or CONFIG.ArcSafeColor
 	local stride = math.max(CONFIG.ArcVisualStride, 1)
 
+	-- Solid connected line made from cylinders.
 	for index = 1, #trajectory - 1, stride do
 		local a = trajectory[index]
 		local b = trajectory[math.min(index + stride, #trajectory)]
@@ -254,9 +270,9 @@ local function drawTrajectoryArc(prediction, danger)
 
 			if distance > 0.001 then
 				local segment = makeArcPart(
-					"ArcSegment",
+					"PathLine",
 					Vector3.new(CONFIG.ArcThickness, distance, CONFIG.ArcThickness),
-					arcColor,
+					lineColor,
 					CONFIG.ArcTransparency
 				)
 
@@ -267,23 +283,7 @@ local function drawTrajectoryArc(prediction, danger)
 		end
 	end
 
-	for index = 1, #trajectory, math.max(stride * 3, 1) do
-		local point = trajectory[index]
-
-		if typeof(point) == "Vector3" then
-			local dot = makeArcPart(
-				"ArcPoint",
-				Vector3.new(CONFIG.ArcPointSize, CONFIG.ArcPointSize, CONFIG.ArcPointSize),
-				CONFIG.ArcPointColor,
-				0.25
-			)
-
-			dot.Shape = Enum.PartType.Ball
-			dot.CFrame = CFrame.new(point)
-			dot.Parent = folder
-		end
-	end
-
+	-- Red endpoint marker only.
 	local markerPosition = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
 
 	if danger and typeof(danger.Position) == "Vector3" then
@@ -292,10 +292,10 @@ local function drawTrajectoryArc(prediction, danger)
 
 	if typeof(markerPosition) == "Vector3" then
 		local marker = makeArcPart(
-			"LandingMarker",
+			"EndMarker",
 			Vector3.new(CONFIG.ArcLandingMarkerSize, CONFIG.ArcLandingMarkerSize, CONFIG.ArcLandingMarkerSize),
-			arcColor,
-			0.05
+			CONFIG.ArcEndMarkerColor,
+			0.02
 		)
 
 		marker.Shape = Enum.PartType.Ball
@@ -574,7 +574,6 @@ local function predictTrajectoryExternal()
 			CastPadding = 0.05,
 			IgnoreWater = true,
 
-			-- If your trajectory API supports this, it prevents duplicate generic arcs.
 			DrawArc = false,
 		}
 	)
@@ -809,55 +808,183 @@ local function getPredictionDanger(prediction)
 end
 
 --------------------------------------------------------------------------
+-- Redirect helpers
+--------------------------------------------------------------------------
+
+local function getClosestPointOnPartBounds(part, worldPoint)
+	if not part or not part:IsA("BasePart") then
+		return nil
+	end
+
+	local localPoint = part.CFrame:PointToObjectSpace(worldPoint)
+	local halfSize = part.Size * 0.5
+
+	local clamped = Vector3.new(
+		math.clamp(localPoint.X, -halfSize.X, halfSize.X),
+		math.clamp(localPoint.Y, -halfSize.Y, halfSize.Y),
+		math.clamp(localPoint.Z, -halfSize.Z, halfSize.Z)
+	)
+
+	return part.CFrame:PointToWorldSpace(clamped)
+end
+
+local function getEscapeDirectionFromPart(part, worldPoint)
+	if not part or not part:IsA("BasePart") then
+		return nil
+	end
+
+	local localPoint = part.CFrame:PointToObjectSpace(worldPoint)
+	local halfSize = part.Size * 0.5
+
+	local closest = getClosestPointOnPartBounds(part, worldPoint)
+
+	if closest then
+		local awayFromClosest = getHorizontal(worldPoint - closest)
+
+		if awayFromClosest.Magnitude > 0.001 then
+			return awayFromClosest.Unit
+		end
+	end
+
+	local distances = {
+		{
+			Distance = math.abs(halfSize.X - localPoint.X),
+			Direction = Vector3.new(1, 0, 0),
+		},
+		{
+			Distance = math.abs(-halfSize.X - localPoint.X),
+			Direction = Vector3.new(-1, 0, 0),
+		},
+		{
+			Distance = math.abs(halfSize.Z - localPoint.Z),
+			Direction = Vector3.new(0, 0, 1),
+		},
+		{
+			Distance = math.abs(-halfSize.Z - localPoint.Z),
+			Direction = Vector3.new(0, 0, -1),
+		},
+	}
+
+	table.sort(distances, function(a, b)
+		return a.Distance < b.Distance
+	end)
+
+	local worldDirection = part.CFrame:VectorToWorldSpace(distances[1].Direction)
+	worldDirection = getHorizontal(worldDirection)
+
+	if worldDirection.Magnitude > 0.001 then
+		return worldDirection.Unit
+	end
+
+	return nil
+end
+
+local function getDangerDistance(danger)
+	if not rootPart or not danger then
+		return math.huge
+	end
+
+	if typeof(danger.Position) == "Vector3" then
+		return (rootPart.Position - danger.Position).Magnitude
+	end
+
+	if danger.Part and danger.Part:IsA("BasePart") then
+		local closest = getClosestPointOnPartBounds(danger.Part, rootPart.Position)
+
+		if closest then
+			return (rootPart.Position - closest).Magnitude
+		end
+	end
+
+	return math.huge
+end
+
+local function getDangerTime(danger)
+	if danger and danger.Prediction and typeof(danger.Prediction.Time) == "number" then
+		return danger.Prediction.Time
+	end
+
+	return math.huge
+end
+
+--------------------------------------------------------------------------
 -- Redirect
 --------------------------------------------------------------------------
 
 local function getSafeVelocity(danger)
 	local currentVelocity = rootPart.AssemblyLinearVelocity
 	local currentHorizontal = getHorizontal(currentVelocity)
-	local dangerPosition = danger.Position
 
+	local desiredDirection = nil
+
+	-- Best: escape toward nearest edge of the acid part.
 	if danger.Part and danger.Part:IsA("BasePart") then
-		dangerPosition = danger.Part.Position
+		desiredDirection = getEscapeDirectionFromPart(danger.Part, rootPart.Position)
 	end
 
-	if typeof(dangerPosition) ~= "Vector3" then
-		dangerPosition = rootPart.Position - rootPart.CFrame.LookVector
+	-- Second: away from actual predicted danger point.
+	if not desiredDirection and typeof(danger.Position) == "Vector3" then
+		local awayFromDangerPoint = getHorizontal(rootPart.Position - danger.Position)
+
+		if awayFromDangerPoint.Magnitude > 0.001 then
+			desiredDirection = awayFromDangerPoint.Unit
+		end
 	end
 
-	local away = getHorizontal(rootPart.Position - dangerPosition)
-
-	if away.Magnitude <= 0.001 then
-		away = -currentHorizontal
+	-- Third: reverse current horizontal motion.
+	if not desiredDirection and currentHorizontal.Magnitude > 0.001 then
+		desiredDirection = (-currentHorizontal).Unit
 	end
 
-	if away.Magnitude <= 0.001 then
-		away = getHorizontal(rootPart.CFrame.LookVector)
+	-- Fourth: look direction.
+	if not desiredDirection then
+		local look = getHorizontal(rootPart.CFrame.LookVector)
+
+		if look.Magnitude > 0.001 then
+			desiredDirection = look.Unit
+		end
 	end
 
-	if away.Magnitude <= 0.001 then
-		away = Vector3.new(1, 0, 0)
+	if not desiredDirection then
+		desiredDirection = Vector3.new(1, 0, 0)
 	end
 
-	local side = Vector3.new(-away.Z, 0, away.X)
-	local desiredDirection = away.Unit
-
-	if side.Magnitude > 0.001 and currentHorizontal:Dot(side) < 0 then
-		side = -side
-	end
+	-- Side bias helps dodge around the pit instead of bouncing straight back.
+	local side = Vector3.new(-desiredDirection.Z, 0, desiredDirection.X)
 
 	if side.Magnitude > 0.001 then
+		if currentHorizontal.Magnitude > 0.001 and currentHorizontal:Dot(side) < 0 then
+			side = -side
+		end
+
 		desiredDirection = (desiredDirection + side.Unit * CONFIG.SideBias).Unit
 	end
 
+	local dangerDistance = getDangerDistance(danger)
+	local dangerTime = getDangerTime(danger)
+
+	local emergency = dangerDistance <= CONFIG.EmergencyRedirectDistance
+		or dangerTime <= CONFIG.EmergencyRedirectTime
+
+	local minSpeed = emergency and CONFIG.RedirectMaxHorizontalSpeed or CONFIG.RedirectHorizontalSpeed
+
 	local horizontalSpeed = math.clamp(
-		math.max(currentHorizontal.Magnitude, CONFIG.RedirectHorizontalSpeed),
-		0,
+		math.max(currentHorizontal.Magnitude, minSpeed),
+		CONFIG.RedirectHorizontalSpeed,
 		CONFIG.RedirectMaxHorizontalSpeed
 	)
 
 	local lift = if string.find(danger.Kind, "Slide") then CONFIG.SlideRedirectLift else CONFIG.RedirectLift
+
+	if emergency then
+		lift = math.max(lift, CONFIG.RedirectLift + 8)
+	end
+
 	local targetY = math.max(currentVelocity.Y, lift)
+
+	if currentVelocity.Y < -20 then
+		targetY = math.max(targetY, 24)
+	end
 
 	return desiredDirection * horizontalSpeed + Vector3.new(0, targetY, 0)
 end
@@ -867,10 +994,38 @@ local function applyRedirect(deltaTime)
 		return
 	end
 
-	local alpha = 1 - math.exp(-CONFIG.RedirectResponsiveness * deltaTime)
-	local targetVelocity = getSafeVelocity(Controller.LastDanger)
+	local danger = Controller.LastDanger
+	local currentVelocity = rootPart.AssemblyLinearVelocity
+	local targetVelocity = getSafeVelocity(danger)
 
-	rootPart.AssemblyLinearVelocity = rootPart.AssemblyLinearVelocity:Lerp(targetVelocity, alpha)
+	local dangerDistance = getDangerDistance(danger)
+	local dangerTime = getDangerTime(danger)
+
+	local emergency = dangerDistance <= CONFIG.EmergencyRedirectDistance
+		or dangerTime <= CONFIG.EmergencyRedirectTime
+
+	local alpha
+
+	if emergency then
+		alpha = CONFIG.EmergencyRedirectAlpha
+	else
+		alpha = 1 - math.exp(-CONFIG.RedirectResponsiveness * deltaTime)
+		alpha = math.max(alpha, CONFIG.NormalRedirectMinAlpha)
+	end
+
+	local newVelocity = currentVelocity:Lerp(targetVelocity, math.clamp(alpha, 0, 1))
+
+	rootPart.AssemblyLinearVelocity = newVelocity
+
+	if CONFIG.ImpulseAssist and rootPart.AssemblyMass > 0 then
+		local deltaVelocity = newVelocity - currentVelocity
+
+		if deltaVelocity.Magnitude > 0.001 then
+			pcall(function()
+				rootPart:ApplyImpulse(deltaVelocity * rootPart.AssemblyMass * CONFIG.ImpulseMultiplier)
+			end)
+		end
+	end
 end
 
 local function shouldPredict()
@@ -937,7 +1092,15 @@ local function onHeartbeat(deltaTime)
 
 			if danger then
 				Controller.LastDanger = danger
-				lastDangerUntil = os.clock() + CONFIG.ApplyWindow
+
+				local dangerDistance = getDangerDistance(danger)
+				local dangerTime = getDangerTime(danger)
+
+				if dangerDistance <= CONFIG.EmergencyRedirectDistance or dangerTime <= CONFIG.EmergencyRedirectTime then
+					lastDangerUntil = os.clock() + math.max(CONFIG.ApplyWindow, 0.65)
+				else
+					lastDangerUntil = os.clock() + CONFIG.ApplyWindow
+				end
 			elseif os.clock() > lastDangerUntil then
 				Controller.LastDanger = nil
 			end

@@ -1,0 +1,330 @@
+-- Trajectory Finder API
+-- LocalScript utility for predicting where a player/character will land.
+-- PredictPlayerLanding(playerObject, options) returns:
+-- trajectoryPoints, hitPart, castResult, predictionData
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local DEFAULT_OPTIONS = {
+	MaxTime = 5,
+	TimeStep = 1 / 60,
+	Gravity = Workspace.Gravity,
+
+	-- These are Roblox-stud tuned values, not real-world SI constants.
+	AirDensity = 0.02,
+	DragCoefficient = 0.7,
+	CrossSectionArea = 1.2,
+
+	MagnusCoefficient = 0.006,
+	MaxMagnusAcceleration = 80,
+
+	-- "Block" is best for characters. Use "Sphere" or "Ray" if needed.
+	CastMode = "Block",
+	CastPadding = 0.05,
+	IgnoreWater = true,
+	IgnoreInstances = nil,
+}
+
+local function isPositiveNumber(value)
+	return typeof(value) == "number" and value > 0
+end
+
+local function mergeOptions(options)
+	local merged = {}
+
+	for key, value in pairs(DEFAULT_OPTIONS) do
+		merged[key] = value
+	end
+
+	if options then
+		for key, value in pairs(options) do
+			merged[key] = value
+		end
+	end
+
+	if not isPositiveNumber(merged.MaxTime) then
+		merged.MaxTime = DEFAULT_OPTIONS.MaxTime
+	end
+
+	if not isPositiveNumber(merged.TimeStep) then
+		merged.TimeStep = DEFAULT_OPTIONS.TimeStep
+	end
+
+	merged.TimeStep = math.clamp(merged.TimeStep, 1 / 240, 1 / 10)
+
+	if typeof(merged.Gravity) ~= "number" or merged.Gravity < 0 then
+		merged.Gravity = DEFAULT_OPTIONS.Gravity
+	end
+
+	if typeof(merged.IgnoreWater) ~= "boolean" then
+		merged.IgnoreWater = DEFAULT_OPTIONS.IgnoreWater
+	end
+
+	return merged
+end
+
+local function getCharacterFromPlayerOrCharacter(playerOrCharacter)
+	if typeof(playerOrCharacter) ~= "Instance" then
+		return nil
+	end
+
+	if playerOrCharacter:IsA("Player") then
+		return playerOrCharacter.Character
+	end
+
+	if playerOrCharacter:IsA("Model") then
+		return playerOrCharacter
+	end
+
+	return nil
+end
+
+local function getRootPart(character)
+	if not character then
+		return nil
+	end
+
+	return character:FindFirstChild("HumanoidRootPart")
+		or character:FindFirstChild("Torso")
+		or character:FindFirstChild("UpperTorso")
+end
+
+local function getMass(rootPart, character, options)
+	if isPositiveNumber(options.Mass) then
+		return options.Mass
+	end
+
+	if rootPart and rootPart:IsA("BasePart") and rootPart.AssemblyMass > 0 then
+		return rootPart.AssemblyMass
+	end
+
+	if character then
+		local totalMass = 0
+
+		for _, descendant in ipairs(character:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				totalMass += descendant:GetMass()
+			end
+		end
+
+		if totalMass > 0 then
+			return totalMass
+		end
+	end
+
+	return 70
+end
+
+local function buildRaycastParams(character, options)
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.IgnoreWater = options.IgnoreWater
+
+	local ignore = {}
+
+	if character then
+		table.insert(ignore, character)
+	end
+
+	if typeof(options.IgnoreInstances) == "table" then
+		for _, instance in ipairs(options.IgnoreInstances) do
+			if typeof(instance) == "Instance" then
+				table.insert(ignore, instance)
+			end
+		end
+	end
+
+	raycastParams.FilterDescendantsInstances = ignore
+	return raycastParams
+end
+
+local function getCastInfo(rootPart, character, options)
+	local rotation = rootPart.CFrame.Rotation
+	local centerOffset = Vector3.zero
+	local size = rootPart.Size
+	local castMode = options.CastMode
+
+	if castMode ~= "Block" and castMode ~= "Sphere" and castMode ~= "Ray" then
+		castMode = DEFAULT_OPTIONS.CastMode
+	end
+
+	if typeof(options.CastSize) == "Vector3" then
+		size = options.CastSize
+	elseif character then
+		local boundsCFrame, boundsSize = character:GetBoundingBox()
+		centerOffset = rootPart.CFrame:PointToObjectSpace(boundsCFrame.Position)
+		size = boundsSize
+	end
+
+	local padding = if isPositiveNumber(options.CastPadding) then options.CastPadding else 0
+	size = Vector3.new(
+		math.max(size.X - padding, 0.1),
+		math.max(size.Y - padding, 0.1),
+		math.max(size.Z - padding, 0.1)
+	)
+
+	local radius = options.CastRadius
+
+	if not isPositiveNumber(radius) then
+		radius = math.max(size.X, size.Z) * 0.5
+	end
+
+	return {
+		Mode = castMode,
+		Rotation = rotation,
+		CenterOffset = centerOffset,
+		Size = size,
+		Radius = math.max(radius, 0.1),
+	}
+end
+
+local function getDragAcceleration(velocity, mass, options)
+	local speed = velocity.Magnitude
+
+	if speed <= 0.001 then
+		return Vector3.zero
+	end
+
+	local airDensity = if typeof(options.AirDensity) == "number" then options.AirDensity else DEFAULT_OPTIONS.AirDensity
+	local dragCoefficient = if typeof(options.DragCoefficient) == "number" then options.DragCoefficient else DEFAULT_OPTIONS.DragCoefficient
+	local crossSectionArea = if typeof(options.CrossSectionArea) == "number" then options.CrossSectionArea else DEFAULT_OPTIONS.CrossSectionArea
+
+	if airDensity <= 0 or dragCoefficient <= 0 or crossSectionArea <= 0 then
+		return Vector3.zero
+	end
+
+	local dragMagnitude = 0.5 * airDensity * dragCoefficient * crossSectionArea * speed * speed
+	return -velocity.Unit * (dragMagnitude / mass)
+end
+
+local function getMagnusAcceleration(velocity, angularVelocity, options)
+	if velocity.Magnitude <= 0.001 or angularVelocity.Magnitude <= 0.001 then
+		return Vector3.zero
+	end
+
+	local coefficient = if typeof(options.MagnusCoefficient) == "number" then options.MagnusCoefficient else DEFAULT_OPTIONS.MagnusCoefficient
+
+	if coefficient <= 0 then
+		return Vector3.zero
+	end
+
+	local magnus = angularVelocity:Cross(velocity) * coefficient
+	local maxAcceleration = if isPositiveNumber(options.MaxMagnusAcceleration) then options.MaxMagnusAcceleration else DEFAULT_OPTIONS.MaxMagnusAcceleration
+
+	if magnus.Magnitude > maxAcceleration then
+		magnus = magnus.Unit * maxAcceleration
+	end
+
+	return magnus
+end
+
+local function castAlongPath(position, displacement, castInfo, raycastParams)
+	if displacement.Magnitude <= 0 then
+		return nil
+	end
+
+	if castInfo.Mode == "Ray" then
+		return Workspace:Raycast(position, displacement, raycastParams)
+	end
+
+	if castInfo.Mode == "Sphere" then
+		return Workspace:Spherecast(position, castInfo.Radius, displacement, raycastParams)
+	end
+
+	local castCenter = position + castInfo.Rotation:VectorToWorldSpace(castInfo.CenterOffset)
+	local castCFrame = CFrame.new(castCenter) * castInfo.Rotation
+
+	return Workspace:Blockcast(castCFrame, castInfo.Size, displacement, raycastParams)
+end
+
+local function returnPrediction(prediction)
+	return prediction.Trajectory, prediction.HitPart, prediction.HitResult, prediction
+end
+
+local function PredictPlayerLanding(playerOrCharacter, options)
+	options = mergeOptions(options)
+
+	local character = getCharacterFromPlayerOrCharacter(playerOrCharacter)
+	local rootPart = getRootPart(character)
+
+	if not rootPart or not rootPart:IsA("BasePart") then
+		return returnPrediction({
+			Trajectory = {},
+			HitResult = nil,
+			HitPart = nil,
+			Reason = "No HumanoidRootPart/Torso found",
+		})
+	end
+
+	local mass = getMass(rootPart, character, options)
+	local position = rootPart.Position
+	local velocity = rootPart.AssemblyLinearVelocity
+	local angularVelocity = rootPart.AssemblyAngularVelocity
+	local gravity = Vector3.new(0, -options.Gravity, 0)
+	local raycastParams = buildRaycastParams(character, options)
+	local castInfo = getCastInfo(rootPart, character, options)
+	local trajectory = { position }
+
+	local elapsed = 0
+
+	while elapsed < options.MaxTime do
+		local step = math.min(options.TimeStep, options.MaxTime - elapsed)
+		local dragAcceleration = getDragAcceleration(velocity, mass, options)
+		local magnusAcceleration = getMagnusAcceleration(velocity, angularVelocity, options)
+		local acceleration = gravity + dragAcceleration + magnusAcceleration
+
+		local nextVelocity = velocity + acceleration * step
+		local nextPosition = position + velocity * step + 0.5 * acceleration * step * step
+		local displacement = nextPosition - position
+		local hitResult = castAlongPath(position, displacement, castInfo, raycastParams)
+
+		if hitResult then
+			local alpha = math.clamp(hitResult.Distance / math.max(displacement.Magnitude, 0.001), 0, 1)
+			local hitRootPosition = position:Lerp(nextPosition, alpha)
+			local hitTime = elapsed + step * alpha
+
+			table.insert(trajectory, hitRootPosition)
+
+			return returnPrediction({
+				Trajectory = trajectory,
+				HitResult = hitResult,
+				HitPart = hitResult.Instance,
+				LandPosition = hitResult.Position,
+				RootPosition = hitRootPosition,
+				LandNormal = hitResult.Normal,
+				Time = hitTime,
+				Velocity = velocity:Lerp(nextVelocity, alpha),
+				CastMode = castInfo.Mode,
+				CastSize = castInfo.Size,
+				CastRadius = castInfo.Radius,
+			})
+		end
+
+		position = nextPosition
+		velocity = nextVelocity
+		elapsed += step
+
+		table.insert(trajectory, position)
+	end
+
+	return returnPrediction({
+		Trajectory = trajectory,
+		HitResult = nil,
+		HitPart = nil,
+		LandPosition = trajectory[#trajectory],
+		RootPosition = trajectory[#trajectory],
+		Time = options.MaxTime,
+		Velocity = velocity,
+		CastMode = castInfo.Mode,
+		CastSize = castInfo.Size,
+		CastRadius = castInfo.Radius,
+		Reason = "No hit within MaxTime",
+	})
+end
+
+-- Example:
+-- local trajectory, hitPart, hitResult, data = PredictPlayerLanding(Players.LocalPlayer)
+-- print(hitPart, data.LandPosition, data.RootPosition)
+
+return select(4, PredictPlayerLanding(...))

@@ -1,0 +1,394 @@
+-- AcidPit Trajectory Redirect
+-- Predicts whether the local player is about to hit or slide into AcidPit parts,
+-- then smoothly blends velocity away from the danger.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local API_URL = "https://raw.githubusercontent.com/XxInsaneX1/ClapperFEPublic/refs/heads/main/TJFPublicRelease"
+
+local CONFIG = {
+	Enabled = true,
+
+	PredictEvery = 1 / 20,
+	PredictionOptions = {
+		MaxTime = 2.5,
+		TimeStep = 1 / 60,
+		CastMode = "Block",
+		CastPadding = 0.05,
+	},
+
+	TrajectoryDangerPadding = 2,
+	SlideDangerPadding = 2.5,
+
+	SlideLookahead = 1.25,
+	SlideTimeStep = 1 / 30,
+	SlideProbeRadius = 1.5,
+	SlideProbeLift = 2.5,
+	SlideSurfaceOffset = 0.2,
+	SlideFriction = 18,
+	MinSlideSpeed = 4,
+	MaxSlideSpeed = 80,
+
+	RedirectResponsiveness = 9,
+	RedirectHorizontalSpeed = 38,
+	RedirectMaxHorizontalSpeed = 72,
+	RedirectLift = 18,
+	SlideRedirectLift = 10,
+	SideBias = 0.2,
+}
+
+local acidPitFolder = Workspace:WaitForChild("Map")
+	:WaitForChild("AcidAbnormality")
+	:WaitForChild("AcidPit")
+
+local apiChunk = assert(loadstring(game:HttpGet(API_URL)))
+local bootstrapOk, bootstrappedApi = pcall(apiChunk)
+
+if not bootstrapOk then
+	bootstrappedApi = nil
+end
+
+local dangerParts = {}
+
+local function rebuildDangerParts()
+	for part in pairs(dangerParts) do
+		dangerParts[part] = nil
+	end
+
+	for _, instance in ipairs(acidPitFolder:GetDescendants()) do
+		if instance:IsA("BasePart") then
+			dangerParts[instance] = true
+		end
+	end
+
+	for _, instance in ipairs(acidPitFolder:GetChildren()) do
+		if instance:IsA("BasePart") then
+			dangerParts[instance] = true
+		end
+	end
+end
+
+local function isDangerousInstance(instance)
+	return instance ~= nil and instance:IsDescendantOf(acidPitFolder)
+end
+
+local function getRootPart(character)
+	if not character then
+		return nil
+	end
+
+	return character:FindFirstChild("HumanoidRootPart")
+		or character:FindFirstChild("Torso")
+		or character:FindFirstChild("UpperTorso")
+end
+
+local function buildCastParams(character)
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.IgnoreWater = true
+	raycastParams.FilterDescendantsInstances = if character then { character } else {}
+	return raycastParams
+end
+
+local function normalizePrediction(first, second, third, fourth)
+	if typeof(fourth) == "table" then
+		return fourth
+	end
+
+	if typeof(first) == "table" and (first.Trajectory or first.HitPart or first.HitResult or first.Reason) then
+		return first
+	end
+
+	if typeof(first) == "table" then
+		return {
+			Trajectory = first,
+			HitPart = second,
+			HitResult = third,
+		}
+	end
+
+	return nil
+end
+
+local function runPredictor(player, options)
+	if typeof(bootstrappedApi) == "function" then
+		local ok, first, second, third, fourth = pcall(bootstrappedApi, player, options)
+		if ok then
+			return normalizePrediction(first, second, third, fourth)
+		end
+	end
+
+	if typeof(bootstrappedApi) == "table" then
+		local predictor = bootstrappedApi.Predict or bootstrappedApi.PredictPlayerLanding
+
+		if typeof(predictor) == "function" then
+			local ok, first, second, third, fourth = pcall(predictor, player, options)
+			if ok then
+				return normalizePrediction(first, second, third, fourth)
+			end
+		end
+	end
+
+	local ok, first, second, third, fourth = pcall(apiChunk, player, options)
+	if ok then
+		return normalizePrediction(first, second, third, fourth)
+	end
+
+	return nil
+end
+
+local function pointInsidePartBounds(point, part, padding)
+	local localPoint = part.CFrame:PointToObjectSpace(point)
+	local halfSize = part.Size * 0.5
+
+	return math.abs(localPoint.X) <= halfSize.X + padding
+		and math.abs(localPoint.Y) <= halfSize.Y + padding
+		and math.abs(localPoint.Z) <= halfSize.Z + padding
+end
+
+local function getPointDangerPart(point, padding)
+	for part in pairs(dangerParts) do
+		if part.Parent and pointInsidePartBounds(point, part, padding) then
+			return part
+		end
+	end
+
+	return nil
+end
+
+local function getPredictionDanger(prediction)
+	if not prediction then
+		return nil
+	end
+
+	local hitPart = prediction.HitPart
+	if not hitPart and prediction.HitResult then
+		hitPart = prediction.HitResult.Instance
+	end
+
+	if isDangerousInstance(hitPart) then
+		return {
+			Kind = "DirectHit",
+			Part = hitPart,
+			Position = prediction.LandPosition or prediction.RootPosition,
+			Prediction = prediction,
+		}
+	end
+
+	for _, point in ipairs(prediction.Trajectory or {}) do
+		local dangerPart = getPointDangerPart(point, CONFIG.TrajectoryDangerPadding)
+
+		if dangerPart then
+			return {
+				Kind = "AirPath",
+				Part = dangerPart,
+				Position = point,
+				Prediction = prediction,
+			}
+		end
+	end
+
+	return nil
+end
+
+local function getSurfaceVelocity(velocity, normal)
+	return velocity - normal * velocity:Dot(normal)
+end
+
+local function simulateSlideDanger(prediction, character)
+	if not prediction or not prediction.HitResult then
+		return nil
+	end
+
+	local normal = prediction.LandNormal or prediction.HitResult.Normal
+	local position = prediction.RootPosition or prediction.LandPosition or prediction.HitResult.Position
+	local velocity = prediction.Velocity or Vector3.zero
+	local slideVelocity = getSurfaceVelocity(velocity, normal)
+	local raycastParams = buildCastParams(character)
+	local elapsed = 0
+
+	if slideVelocity.Magnitude < CONFIG.MinSlideSpeed and normal.Y > 0.85 then
+		return nil
+	end
+
+	while elapsed < CONFIG.SlideLookahead do
+		local step = math.min(CONFIG.SlideTimeStep, CONFIG.SlideLookahead - elapsed)
+		local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+		local downhillAcceleration = gravity - normal * gravity:Dot(normal)
+		local friction = Vector3.zero
+
+		if slideVelocity.Magnitude > 0.001 then
+			local frictionMagnitude = math.min(CONFIG.SlideFriction, slideVelocity.Magnitude / step)
+			friction = -slideVelocity.Unit * frictionMagnitude
+		end
+
+		slideVelocity += (downhillAcceleration + friction) * step
+
+		if slideVelocity.Magnitude > CONFIG.MaxSlideSpeed then
+			slideVelocity = slideVelocity.Unit * CONFIG.MaxSlideSpeed
+		end
+
+		local displacement = slideVelocity * step
+
+		if displacement.Magnitude <= 0.001 then
+			return nil
+		end
+
+		local castStart = position + normal * (CONFIG.SlideProbeRadius + CONFIG.SlideSurfaceOffset)
+		local sideHit = Workspace:Spherecast(castStart, CONFIG.SlideProbeRadius, displacement, raycastParams)
+
+		if sideHit then
+			if isDangerousInstance(sideHit.Instance) then
+				return {
+					Kind = "SlideHit",
+					Part = sideHit.Instance,
+					Position = sideHit.Position,
+					Prediction = prediction,
+				}
+			end
+
+			normal = sideHit.Normal
+			position = sideHit.Position + normal * CONFIG.SlideSurfaceOffset
+			slideVelocity = getSurfaceVelocity(slideVelocity, normal)
+		else
+			position += displacement
+		end
+
+		local overlapPart = getPointDangerPart(position, CONFIG.SlideDangerPadding)
+		if overlapPart then
+			return {
+				Kind = "SlideOverlap",
+				Part = overlapPart,
+				Position = position,
+				Prediction = prediction,
+			}
+		end
+
+		local groundStart = position + Vector3.new(0, CONFIG.SlideProbeLift, 0)
+		local groundDisplacement = Vector3.new(0, -CONFIG.SlideProbeLift * 2, 0)
+		local groundHit = Workspace:Spherecast(groundStart, CONFIG.SlideProbeRadius, groundDisplacement, raycastParams)
+
+		if not groundHit then
+			return nil
+		end
+
+		if isDangerousInstance(groundHit.Instance) then
+			return {
+				Kind = "SlideGround",
+				Part = groundHit.Instance,
+				Position = groundHit.Position,
+				Prediction = prediction,
+			}
+		end
+
+		normal = groundHit.Normal
+		position = groundHit.Position + normal * CONFIG.SlideSurfaceOffset
+		slideVelocity = getSurfaceVelocity(slideVelocity, normal)
+		elapsed += step
+	end
+
+	return nil
+end
+
+local function getHorizontal(vector)
+	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function getSafeVelocity(rootPart, danger)
+	local currentVelocity = rootPart.AssemblyLinearVelocity
+	local currentHorizontal = getHorizontal(currentVelocity)
+	local dangerPosition = danger.Position
+
+	if danger.Part and danger.Part:IsA("BasePart") then
+		dangerPosition = danger.Part.Position
+	end
+
+	if typeof(dangerPosition) ~= "Vector3" then
+		dangerPosition = rootPart.Position - rootPart.CFrame.LookVector
+	end
+
+	local away = getHorizontal(rootPart.Position - dangerPosition)
+
+	if away.Magnitude <= 0.001 then
+		away = -currentHorizontal
+	end
+
+	if away.Magnitude <= 0.001 then
+		away = getHorizontal(rootPart.CFrame.LookVector)
+	end
+
+	if away.Magnitude <= 0.001 then
+		away = Vector3.new(1, 0, 0)
+	end
+
+	local side = Vector3.new(-away.Z, 0, away.X)
+	local desiredDirection = away.Unit
+
+	if side.Magnitude > 0.001 and currentHorizontal:Dot(side) < 0 then
+		side = -side
+	end
+
+	if side.Magnitude > 0.001 then
+		desiredDirection = (desiredDirection + side.Unit * CONFIG.SideBias).Unit
+	end
+
+	local horizontalSpeed = math.clamp(
+		math.max(currentHorizontal.Magnitude, CONFIG.RedirectHorizontalSpeed),
+		0,
+		CONFIG.RedirectMaxHorizontalSpeed
+	)
+	local lift = if string.find(danger.Kind, "Slide") then CONFIG.SlideRedirectLift else CONFIG.RedirectLift
+	local targetY = math.max(currentVelocity.Y, lift)
+
+	return desiredDirection * horizontalSpeed + Vector3.new(0, targetY, 0)
+end
+
+local function applyRedirect(rootPart, danger, deltaTime)
+	local targetVelocity = getSafeVelocity(rootPart, danger)
+	local alpha = 1 - math.exp(-CONFIG.RedirectResponsiveness * deltaTime)
+	rootPart.AssemblyLinearVelocity = rootPart.AssemblyLinearVelocity:Lerp(targetVelocity, alpha)
+end
+
+rebuildDangerParts()
+acidPitFolder.DescendantAdded:Connect(function(instance)
+	if instance:IsA("BasePart") then
+		dangerParts[instance] = true
+	end
+end)
+acidPitFolder.DescendantRemoving:Connect(function(instance)
+	dangerParts[instance] = nil
+end)
+
+local accumulated = 0
+local lastDanger = nil
+
+RunService.Heartbeat:Connect(function(deltaTime)
+	if not CONFIG.Enabled then
+		lastDanger = nil
+		return
+	end
+
+	accumulated += deltaTime
+
+	local character = LocalPlayer.Character
+	local rootPart = getRootPart(character)
+
+	if not rootPart then
+		lastDanger = nil
+		return
+	end
+
+	if accumulated >= CONFIG.PredictEvery then
+		accumulated = 0
+
+		local prediction = runPredictor(LocalPlayer, CONFIG.PredictionOptions)
+		lastDanger = getPredictionDanger(prediction) or simulateSlideDanger(prediction, character)
+	end
+
+	if lastDanger then
+		applyRedirect(rootPart, lastDanger, deltaTime)
+	end
+end)

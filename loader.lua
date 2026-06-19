@@ -1,8 +1,9 @@
 --------------------------------------------------------------------------
 -- AntiFling -- core protection + sleek black settings GUI
--- Fixed version:
--- - Properly checks trajectory API function
--- - Properly stores/stops AcidRedirect controller
+-- Synced version:
+-- - Loads Trajectory API and stores predictor
+-- - Passes predictor into AcidRedirect API
+-- - AcidRedirect arc support synced
 -- - AntiFling no longer fights AcidRedirect
 -- - Singleton cleanup prevents duplicate GUIs/loops
 --------------------------------------------------------------------------
@@ -56,6 +57,7 @@ local AcidRedirect = {
 	Loaded = false,
 	LoadToken = 0,
 	Controller = nil,
+	Predictor = nil,
 	LastError = nil,
 }
 
@@ -86,10 +88,23 @@ end
 local function isAcidRedirecting()
 	local controller = getAcidController()
 
-	return AcidRedirect.Enabled
-		and controller ~= nil
-		and typeof(controller) == "table"
-		and controller.LastDanger ~= nil
+	if not AcidRedirect.Enabled then
+		return false
+	end
+
+	if typeof(controller) ~= "table" then
+		return false
+	end
+
+	if typeof(controller.IsRedirecting) == "function" then
+		local ok, result = pcall(controller.IsRedirecting)
+
+		if ok then
+			return result == true
+		end
+	end
+
+	return controller.LastDanger ~= nil
 end
 
 local function getMaxUpwardVelocity()
@@ -120,12 +135,9 @@ local function clampVelocity()
 	local velocity = RootPart.AssemblyLinearVelocity
 	local redirectingFromAcid = isAcidRedirecting()
 
-	-- Horizontal speed cap.
 	local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
 	local maxHorizontal = Humanoid.WalkSpeed * Settings.HorizontalMultiplier
 
-	-- Important fix:
-	-- AcidRedirect needs room to apply its redirect velocity.
 	if redirectingFromAcid then
 		maxHorizontal = math.max(maxHorizontal, 80)
 	end
@@ -140,7 +152,6 @@ local function clampVelocity()
 		end
 	end
 
-	-- Vertical clamp.
 	local maxUpward = getMaxUpwardVelocity()
 	local minDownward = -math.huge
 
@@ -161,7 +172,6 @@ local function clampVelocity()
 		RootPart.AssemblyLinearVelocity = newVelocity
 	end
 
-	-- Kill excessive spin.
 	local angular = RootPart.AssemblyAngularVelocity
 
 	if angular.Magnitude > Settings.MaxAngularSpeed then
@@ -538,17 +548,17 @@ local function checkTrajectoryApi()
 	local chunk, loadError = loadRemoteChunk(TRAJECTORY_API_URL)
 
 	if not chunk then
-		return false, loadError
+		return false, loadError, nil
 	end
 
 	local ok, predictorOrError = pcall(chunk)
 
 	if not ok then
-		return false, predictorOrError
+		return false, predictorOrError, nil
 	end
 
 	if typeof(predictorOrError) ~= "function" then
-		return false, "trajectory API did not return PredictPlayerLanding function"
+		return false, "trajectory API did not return PredictPlayerLanding function", nil
 	end
 
 	local predictOk, trajectory, hitPart, hitResult, predictionData = pcall(
@@ -557,19 +567,21 @@ local function checkTrajectoryApi()
 		{
 			MaxTime = 0.25,
 			TimeStep = 1 / 60,
-			CastMode = "Block",
+			CastMode = "Sphere",
+			CastRadius = 1.65,
+			DrawArc = false,
 		}
 	)
 
 	if not predictOk then
-		return false, trajectory
+		return false, trajectory, nil
 	end
 
 	if typeof(predictionData) ~= "table" then
-		return false, "trajectory API returned no prediction table"
+		return false, "trajectory API returned no prediction table", nil
 	end
 
-	return true, nil
+	return true, nil, predictorOrError
 end
 
 local function stopAcidRedirect()
@@ -579,6 +591,12 @@ local function stopAcidRedirect()
 		AcidRedirect.LoadToken += 1
 
 		if controller then
+			if typeof(controller.HideArc) == "function" then
+				pcall(controller.HideArc)
+			elseif typeof(controller.ClearArc) == "function" then
+				pcall(controller.ClearArc)
+			end
+
 			if typeof(controller.Destroy) == "function" then
 				pcall(controller.Destroy)
 			elseif typeof(controller.Stop) == "function" then
@@ -594,6 +612,7 @@ local function stopAcidRedirect()
 		AcidRedirect.Loaded = false
 		AcidRedirect.Loading = false
 		AcidRedirect.Controller = nil
+		AcidRedirect.Predictor = nil
 		AcidRedirect.LastError = nil
 
 		setAcidStatus("Disabled", false)
@@ -604,6 +623,8 @@ local function stopAcidRedirect()
 	AcidRedirect.Enabled = false
 	AcidRedirect.Loading = false
 	AcidRedirect.LoadToken += 1
+	AcidRedirect.Controller = nil
+	AcidRedirect.Predictor = nil
 	AcidRedirect.LastError = nil
 
 	setAcidStatus("Disabled", false)
@@ -616,6 +637,10 @@ local function startAcidRedirect()
 
 		if controller and typeof(controller.Start) == "function" then
 			pcall(controller.Start)
+		end
+
+		if controller and typeof(controller.ShowArc) == "function" then
+			pcall(controller.ShowArc)
 		end
 
 		AcidRedirect.Enabled = true
@@ -640,7 +665,7 @@ local function startAcidRedirect()
 	notify("Acid-Redirect", "Checking trajectory tracker and redirect API.")
 
 	task.spawn(function()
-		local trajectoryOk, trajectoryError = checkTrajectoryApi()
+		local trajectoryOk, trajectoryError, predictor = checkTrajectoryApi()
 
 		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
 			return
@@ -649,6 +674,7 @@ local function startAcidRedirect()
 		if not trajectoryOk then
 			AcidRedirect.Enabled = false
 			AcidRedirect.Loading = false
+			AcidRedirect.Predictor = nil
 			AcidRedirect.LastError = tostring(trajectoryError)
 
 			setAcidStatus("Trajectory failed", false)
@@ -661,6 +687,8 @@ local function startAcidRedirect()
 			return
 		end
 
+		AcidRedirect.Predictor = predictor
+
 		local redirectChunk, redirectError = loadRemoteChunk(ACID_REDIRECT_API_URL)
 
 		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
@@ -670,6 +698,7 @@ local function startAcidRedirect()
 		if not redirectChunk then
 			AcidRedirect.Enabled = false
 			AcidRedirect.Loading = false
+			AcidRedirect.Predictor = nil
 			AcidRedirect.LastError = tostring(redirectError)
 
 			setAcidStatus("Redirect failed", false)
@@ -682,7 +711,15 @@ local function startAcidRedirect()
 			return
 		end
 
-		local ok, resultOrError = pcall(redirectChunk)
+		local ok, resultOrError = pcall(redirectChunk, {
+			PredictPlayerLanding = predictor,
+			ShowTrajectoryArc = true,
+
+			Config = {
+				ShowTrajectoryArc = true,
+				ClearArcWhenIdle = true,
+			},
+		})
 
 		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
 			return
@@ -691,6 +728,7 @@ local function startAcidRedirect()
 		if not ok then
 			AcidRedirect.Enabled = false
 			AcidRedirect.Loading = false
+			AcidRedirect.Predictor = nil
 			AcidRedirect.LastError = tostring(resultOrError)
 
 			setAcidStatus("Runtime failed", false)
@@ -711,6 +749,7 @@ local function startAcidRedirect()
 			AcidRedirect.Loading = false
 			AcidRedirect.Loaded = false
 			AcidRedirect.Controller = nil
+			AcidRedirect.Predictor = nil
 			AcidRedirect.LastError = "Redirect API did not return a controller table"
 
 			setAcidStatus("No controller", false)
@@ -723,12 +762,20 @@ local function startAcidRedirect()
 			return
 		end
 
+		if typeof(controller.SetPredictor) == "function" then
+			pcall(controller.SetPredictor, predictor)
+		end
+
+		if typeof(controller.ShowArc) == "function" then
+			pcall(controller.ShowArc)
+		end
+
 		AcidRedirect.Loading = false
 		AcidRedirect.Loaded = true
 		AcidRedirect.Controller = controller
 
 		setAcidStatus("Active", true)
-		notify("Acid-Redirect", "Active. AcidPit trajectory redirects are running.")
+		notify("Acid-Redirect", "Active. Synced trajectory API and AcidPit redirects are running.")
 	end)
 end
 
@@ -1099,4 +1146,4 @@ global.__AntiFlingGuiController = {
 }
 
 notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready.")
-print("[AntiFling] Loaded with fixed Acid-Redirect GUI")
+print("[AntiFling] Loaded with synced Acid-Redirect GUI")

@@ -1,10 +1,13 @@
--- AcidPit Trajectory Redirect v2
--- Lower-lag redirect controller with cached AcidPit queries and friction-based slide prediction.
--- Fixed version:
+-- AcidPit Trajectory Redirect v3
+-- Synced with Trajectory Finder API + visible AcidRedirect arc.
+-- Features:
 -- - Returns Controller
 -- - Cleans old controller
 -- - WaitForChild timeouts
--- - Better Destroy cleanup
+-- - Uses external PredictPlayerLanding API if passed from loader
+-- - Falls back to internal predictor if no external API is provided
+-- - Draws visible trajectory arc when velocity/prediction activates
+-- - Clears arc when idle/stopped/destroyed
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -13,12 +16,43 @@ local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 local global = if getgenv then getgenv() else _G
 
+local loaderOptions = ...
+if typeof(loaderOptions) ~= "table" then
+	loaderOptions = {}
+end
+
+local ExternalPredictPlayerLanding = nil
+if typeof(loaderOptions.PredictPlayerLanding) == "function" then
+	ExternalPredictPlayerLanding = loaderOptions.PredictPlayerLanding
+end
+
 if global.__AcidRedirectController and typeof(global.__AcidRedirectController.Destroy) == "function" then
 	pcall(global.__AcidRedirectController.Destroy)
 end
 
 local CONFIG = {
 	Enabled = true,
+
+	--------------------------------------------------------------------------
+	-- Arc visualizer
+	--------------------------------------------------------------------------
+
+	ShowTrajectoryArc = true,
+	ClearArcWhenIdle = true,
+	ArcFolderName = "__AcidRedirectTrajectoryArc",
+	ArcVisualStride = 2,
+	ArcThickness = 0.12,
+	ArcPointSize = 0.3,
+	ArcLandingMarkerSize = 0.85,
+	ArcSafeColor = Color3.fromRGB(0, 255, 180),
+	ArcDangerColor = Color3.fromRGB(255, 70, 70),
+	ArcPointColor = Color3.fromRGB(255, 255, 255),
+	ArcTransparency = 0.15,
+	ArcMaterial = Enum.Material.Neon,
+
+	--------------------------------------------------------------------------
+	-- Prediction
+	--------------------------------------------------------------------------
 
 	PredictEvery = 0.14,
 	ApplyWindow = 0.34,
@@ -37,6 +71,10 @@ local CONFIG = {
 	MagnusCoefficient = 0.003,
 	MaxMagnusAcceleration = 45,
 
+	--------------------------------------------------------------------------
+	-- Slide prediction
+	--------------------------------------------------------------------------
+
 	SlideLookahead = 1.5,
 	SlideTimeStep = 1 / 12,
 	SlideDangerRadius = 3.25,
@@ -50,6 +88,10 @@ local CONFIG = {
 	RagdollFrictionMultiplier = 0.55,
 	StandingFrictionMultiplier = 1.2,
 
+	--------------------------------------------------------------------------
+	-- Redirect
+	--------------------------------------------------------------------------
+
 	RedirectResponsiveness = 8.5,
 	RedirectHorizontalSpeed = 38,
 	RedirectMaxHorizontalSpeed = 74,
@@ -57,6 +99,16 @@ local CONFIG = {
 	SlideRedirectLift = 10,
 	SideBias = 0.22,
 }
+
+if typeof(loaderOptions.ShowTrajectoryArc) == "boolean" then
+	CONFIG.ShowTrajectoryArc = loaderOptions.ShowTrajectoryArc
+end
+
+if typeof(loaderOptions.Config) == "table" then
+	for key, value in pairs(loaderOptions.Config) do
+		CONFIG[key] = value
+	end
+end
 
 local map = Workspace:WaitForChild("Map", 10)
 assert(map, "Map folder not found")
@@ -71,7 +123,9 @@ local Controller = {
 	Enabled = CONFIG.Enabled,
 	Config = CONFIG,
 	LastDanger = nil,
+	LastPrediction = nil,
 	LastError = nil,
+	UsingExternalTrajectoryApi = ExternalPredictPlayerLanding ~= nil,
 }
 
 local character
@@ -104,6 +158,155 @@ local function clearArray(array)
 		array[index] = nil
 	end
 end
+
+--------------------------------------------------------------------------
+-- Arc visualizer
+--------------------------------------------------------------------------
+
+local function getArcFolder()
+	local folder = Workspace:FindFirstChild(CONFIG.ArcFolderName)
+
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = CONFIG.ArcFolderName
+		folder.Parent = Workspace
+	end
+
+	return folder
+end
+
+local function clearTrajectoryArc()
+	local folder = Workspace:FindFirstChild(CONFIG.ArcFolderName)
+
+	if not folder then
+		return
+	end
+
+	for _, child in ipairs(folder:GetChildren()) do
+		child:Destroy()
+	end
+end
+
+local function makeArcPart(name, size, color, transparency)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Material = CONFIG.ArcMaterial
+	part.Color = color
+	part.Transparency = transparency
+	part.Size = size
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+
+	return part
+end
+
+local function getCylinderCFrameBetween(a, b)
+	local midpoint = (a + b) * 0.5
+	local direction = b - a
+
+	if direction.Magnitude <= 0.001 then
+		return CFrame.new(midpoint)
+	end
+
+	local up = direction.Unit
+	local right = up:Cross(Vector3.new(0, 0, 1))
+
+	if right.Magnitude <= 0.001 then
+		right = up:Cross(Vector3.new(1, 0, 0))
+	end
+
+	right = right.Unit
+
+	local back = right:Cross(up).Unit
+
+	return CFrame.fromMatrix(midpoint, right, up, back)
+end
+
+local function drawTrajectoryArc(prediction, danger)
+	if not CONFIG.ShowTrajectoryArc then
+		return
+	end
+
+	clearTrajectoryArc()
+
+	if not prediction or typeof(prediction.Trajectory) ~= "table" or #prediction.Trajectory <= 0 then
+		return
+	end
+
+	local trajectory = prediction.Trajectory
+	local folder = getArcFolder()
+	local isDanger = danger ~= nil
+
+	local arcColor = isDanger and CONFIG.ArcDangerColor or CONFIG.ArcSafeColor
+	local stride = math.max(CONFIG.ArcVisualStride, 1)
+
+	for index = 1, #trajectory - 1, stride do
+		local a = trajectory[index]
+		local b = trajectory[math.min(index + stride, #trajectory)]
+
+		if typeof(a) == "Vector3" and typeof(b) == "Vector3" then
+			local distance = (b - a).Magnitude
+
+			if distance > 0.001 then
+				local segment = makeArcPart(
+					"ArcSegment",
+					Vector3.new(CONFIG.ArcThickness, distance, CONFIG.ArcThickness),
+					arcColor,
+					CONFIG.ArcTransparency
+				)
+
+				segment.Shape = Enum.PartType.Cylinder
+				segment.CFrame = getCylinderCFrameBetween(a, b)
+				segment.Parent = folder
+			end
+		end
+	end
+
+	for index = 1, #trajectory, math.max(stride * 3, 1) do
+		local point = trajectory[index]
+
+		if typeof(point) == "Vector3" then
+			local dot = makeArcPart(
+				"ArcPoint",
+				Vector3.new(CONFIG.ArcPointSize, CONFIG.ArcPointSize, CONFIG.ArcPointSize),
+				CONFIG.ArcPointColor,
+				0.25
+			)
+
+			dot.Shape = Enum.PartType.Ball
+			dot.CFrame = CFrame.new(point)
+			dot.Parent = folder
+		end
+	end
+
+	local markerPosition = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
+
+	if danger and typeof(danger.Position) == "Vector3" then
+		markerPosition = danger.Position
+	end
+
+	if typeof(markerPosition) == "Vector3" then
+		local marker = makeArcPart(
+			"LandingMarker",
+			Vector3.new(CONFIG.ArcLandingMarkerSize, CONFIG.ArcLandingMarkerSize, CONFIG.ArcLandingMarkerSize),
+			arcColor,
+			0.05
+		)
+
+		marker.Shape = Enum.PartType.Ball
+		marker.CFrame = CFrame.new(markerPosition)
+		marker.Parent = folder
+	end
+end
+
+--------------------------------------------------------------------------
+-- Acid cache
+--------------------------------------------------------------------------
 
 local function rebuildAcidParts()
 	clearArray(acidParts)
@@ -260,7 +463,11 @@ local function getMagnusAcceleration(velocity, angularVelocity)
 	return magnus
 end
 
-local function predictTrajectory()
+--------------------------------------------------------------------------
+-- Prediction
+--------------------------------------------------------------------------
+
+local function predictTrajectoryInternal()
 	if not rootPart or not rootPart.Parent then
 		return nil
 	end
@@ -301,6 +508,7 @@ local function predictTrajectory()
 					LandNormal = hitResult.Normal,
 					Time = elapsed + step * alpha,
 					Velocity = velocity:Lerp(nextVelocity, alpha),
+					Source = "Internal",
 				}
 			end
 		end
@@ -320,6 +528,7 @@ local function predictTrajectory()
 					Time = elapsed + step,
 					Velocity = nextVelocity,
 					NearDangerPart = dangerPart,
+					Source = "Internal",
 				}
 			end
 		end
@@ -337,8 +546,69 @@ local function predictTrajectory()
 		RootPosition = position,
 		Time = CONFIG.PredictionMaxTime,
 		Velocity = velocity,
+		Source = "Internal",
 	}
 end
+
+local function predictTrajectoryExternal()
+	if not ExternalPredictPlayerLanding then
+		return nil
+	end
+
+	local ok, trajectory, hitPart, hitResult, prediction = pcall(
+		ExternalPredictPlayerLanding,
+		LocalPlayer,
+		{
+			MaxTime = CONFIG.PredictionMaxTime,
+			TimeStep = CONFIG.PredictionTimeStep,
+			Gravity = Workspace.Gravity,
+
+			AirDensity = CONFIG.AirDensity,
+			DragCoefficient = CONFIG.DragCoefficient,
+			CrossSectionArea = CONFIG.CrossSectionArea,
+			MagnusCoefficient = CONFIG.MagnusCoefficient,
+			MaxMagnusAcceleration = CONFIG.MaxMagnusAcceleration,
+
+			CastMode = "Sphere",
+			CastRadius = CONFIG.CharacterRadius,
+			CastPadding = 0.05,
+			IgnoreWater = true,
+
+			-- If your trajectory API supports this, it prevents duplicate generic arcs.
+			DrawArc = false,
+		}
+	)
+
+	if not ok then
+		Controller.LastError = tostring(trajectory)
+		return nil
+	end
+
+	if typeof(prediction) ~= "table" then
+		return nil
+	end
+
+	prediction.Trajectory = prediction.Trajectory or trajectory or {}
+	prediction.HitPart = prediction.HitPart or hitPart
+	prediction.HitResult = prediction.HitResult or hitResult
+	prediction.Source = "External"
+
+	return prediction
+end
+
+local function predictTrajectory()
+	local externalPrediction = predictTrajectoryExternal()
+
+	if externalPrediction then
+		return externalPrediction
+	end
+
+	return predictTrajectoryInternal()
+end
+
+--------------------------------------------------------------------------
+-- Slide prediction
+--------------------------------------------------------------------------
 
 local function getSurfaceVelocity(velocity, normal)
 	return velocity - normal * velocity:Dot(normal)
@@ -431,8 +701,7 @@ local function simulateSlideDanger(prediction)
 			return nil
 		end
 
-		local displacement = slideVelocity * step
-		position += displacement
+		position += slideVelocity * step
 
 		local dangerPart = getDangerNearPoint(position, CONFIG.SlideDangerRadius)
 
@@ -469,12 +738,59 @@ local function simulateSlideDanger(prediction)
 	return nil
 end
 
+--------------------------------------------------------------------------
+-- Danger detection
+--------------------------------------------------------------------------
+
+local function scanTrajectoryForDanger(prediction)
+	if not prediction or typeof(prediction.Trajectory) ~= "table" then
+		return nil
+	end
+
+	local trajectory = prediction.Trajectory
+	local stride = math.max(CONFIG.TrajectorySampleStride, 1)
+
+	for index = 1, #trajectory, stride do
+		local point = trajectory[index]
+
+		if typeof(point) == "Vector3" then
+			local dangerPart = getDangerNearPoint(point, CONFIG.TrajectoryDangerRadius)
+
+			if dangerPart then
+				return {
+					Kind = "AirPath",
+					Part = dangerPart,
+					Position = point,
+					Prediction = prediction,
+				}
+			end
+		end
+	end
+
+	return nil
+end
+
 local function getPredictionDanger(prediction)
 	if not prediction then
 		return nil
 	end
 
-	local hitPart = prediction.NearDangerPart or prediction.HitPart
+	if prediction.NearDangerPart then
+		return {
+			Kind = "AirPath",
+			Part = prediction.NearDangerPart,
+			Position = prediction.LandPosition or prediction.RootPosition,
+			Prediction = prediction,
+		}
+	end
+
+	local airPathDanger = scanTrajectoryForDanger(prediction)
+
+	if airPathDanger then
+		return airPathDanger
+	end
+
+	local hitPart = prediction.HitPart
 
 	if not hitPart and prediction.HitResult then
 		hitPart = prediction.HitResult.Instance
@@ -482,7 +798,7 @@ local function getPredictionDanger(prediction)
 
 	if isDangerousInstance(hitPart) then
 		return {
-			Kind = prediction.NearDangerPart and "AirPath" or "DirectHit",
+			Kind = "DirectHit",
 			Part = hitPart,
 			Position = prediction.LandPosition or prediction.RootPosition,
 			Prediction = prediction,
@@ -491,6 +807,10 @@ local function getPredictionDanger(prediction)
 
 	return simulateSlideDanger(prediction)
 end
+
+--------------------------------------------------------------------------
+-- Redirect
+--------------------------------------------------------------------------
 
 local function getSafeVelocity(danger)
 	local currentVelocity = rootPart.AssemblyLinearVelocity
@@ -589,6 +909,12 @@ end
 local function onHeartbeat(deltaTime)
 	if not Controller.Enabled then
 		Controller.LastDanger = nil
+		Controller.LastPrediction = nil
+
+		if CONFIG.ClearArcWhenIdle then
+			clearTrajectoryArc()
+		end
+
 		return
 	end
 
@@ -606,6 +932,9 @@ local function onHeartbeat(deltaTime)
 			local prediction = predictTrajectory()
 			local danger = getPredictionDanger(prediction)
 
+			Controller.LastPrediction = prediction
+			drawTrajectoryArc(prediction, danger)
+
 			if danger then
 				Controller.LastDanger = danger
 				lastDangerUntil = os.clock() + CONFIG.ApplyWindow
@@ -614,6 +943,11 @@ local function onHeartbeat(deltaTime)
 			end
 		elseif os.clock() > lastDangerUntil then
 			Controller.LastDanger = nil
+			Controller.LastPrediction = nil
+
+			if CONFIG.ClearArcWhenIdle then
+				clearTrajectoryArc()
+			end
 		end
 	end
 
@@ -621,6 +955,10 @@ local function onHeartbeat(deltaTime)
 		applyRedirect(deltaTime)
 	end
 end
+
+--------------------------------------------------------------------------
+-- Controller API
+--------------------------------------------------------------------------
 
 function Controller.Start()
 	Controller.Enabled = true
@@ -631,7 +969,49 @@ function Controller.Stop()
 	Controller.Enabled = false
 	CONFIG.Enabled = false
 	Controller.LastDanger = nil
+	Controller.LastPrediction = nil
 	lastDangerUntil = 0
+
+	if CONFIG.ClearArcWhenIdle then
+		clearTrajectoryArc()
+	end
+end
+
+function Controller.ShowArc()
+	CONFIG.ShowTrajectoryArc = true
+end
+
+function Controller.HideArc()
+	CONFIG.ShowTrajectoryArc = false
+	clearTrajectoryArc()
+end
+
+function Controller.ClearArc()
+	clearTrajectoryArc()
+end
+
+function Controller.SetConfig(nextConfig)
+	if typeof(nextConfig) ~= "table" then
+		return
+	end
+
+	for key, value in pairs(nextConfig) do
+		CONFIG[key] = value
+	end
+end
+
+function Controller.SetPredictor(predictor)
+	if typeof(predictor) == "function" then
+		ExternalPredictPlayerLanding = predictor
+		Controller.UsingExternalTrajectoryApi = true
+	else
+		ExternalPredictPlayerLanding = nil
+		Controller.UsingExternalTrajectoryApi = false
+	end
+end
+
+function Controller.IsRedirecting()
+	return Controller.LastDanger ~= nil and os.clock() <= lastDangerUntil
 end
 
 function Controller.Destroy()
@@ -649,23 +1029,20 @@ function Controller.Destroy()
 		pcall(function()
 			heartbeatConnection:Disconnect()
 		end)
+
 		heartbeatConnection = nil
 	end
+
+	clearTrajectoryArc()
 
 	if global.__AcidRedirectController == Controller then
 		global.__AcidRedirectController = nil
 	end
 end
 
-function Controller.SetConfig(nextConfig)
-	if typeof(nextConfig) ~= "table" then
-		return
-	end
-
-	for key, value in pairs(nextConfig) do
-		CONFIG[key] = value
-	end
-end
+--------------------------------------------------------------------------
+-- Startup
+--------------------------------------------------------------------------
 
 rebuildAcidParts()
 setupCharacter(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())

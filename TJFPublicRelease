@@ -7,6 +7,34 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
+--------------------------------------------------------------------------
+-- TRAJECTORY ARC VISUALIZER SETTINGS
+--------------------------------------------------------------------------
+
+local SHOW_TRAJECTORY_ARC = true -- toggle this true/false
+
+local ARC_FOLDER_NAME = "__TrajectoryArcVisuals"
+local ARC_COLOR = Color3.fromRGB(0, 255, 180)
+local ARC_HIT_COLOR = Color3.fromRGB(255, 80, 80)
+local ARC_POINT_COLOR = Color3.fromRGB(255, 255, 255)
+
+local ARC_THICKNESS = 0.12
+local ARC_POINT_SIZE = 0.32
+local ARC_LANDING_MARKER_SIZE = 0.85
+
+local ARC_TRANSPARENCY = 0.15
+local ARC_MATERIAL = Enum.Material.Neon
+
+-- Higher number = fewer visual parts.
+-- 1 = smoothest but more parts.
+-- 2 or 3 = better performance.
+local ARC_VISUAL_STRIDE = 2
+
+-- If true, old arc is deleted every time a new prediction is made.
+local CLEAR_OLD_ARC_EACH_PREDICTION = true
+
+--------------------------------------------------------------------------
+
 local DEFAULT_OPTIONS = {
 	MaxTime = 5,
 	TimeStep = 1 / 60,
@@ -30,6 +58,140 @@ local DEFAULT_OPTIONS = {
 	CastSize = nil,
 	CastRadius = nil,
 }
+
+local function getArcFolder()
+	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
+
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = ARC_FOLDER_NAME
+		folder.Parent = Workspace
+	end
+
+	return folder
+end
+
+local function clearArcFolder()
+	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
+
+	if not folder then
+		return
+	end
+
+	for _, child in ipairs(folder:GetChildren()) do
+		child:Destroy()
+	end
+end
+
+local function makeArcPart(name, size, color, transparency)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Material = ARC_MATERIAL
+	part.Color = color
+	part.Transparency = transparency
+	part.Size = size
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+
+	return part
+end
+
+local function getCylinderCFrameBetween(a, b)
+	local midpoint = (a + b) * 0.5
+	local direction = b - a
+	local up = direction.Unit
+
+	local right = up:Cross(Vector3.new(0, 0, 1))
+
+	if right.Magnitude <= 0.001 then
+		right = up:Cross(Vector3.new(1, 0, 0))
+	end
+
+	right = right.Unit
+
+	local back = right:Cross(up).Unit
+
+	return CFrame.fromMatrix(midpoint, right, up, back)
+end
+
+local function drawTrajectoryArc(prediction)
+	if not SHOW_TRAJECTORY_ARC then
+		return
+	end
+
+	if CLEAR_OLD_ARC_EACH_PREDICTION then
+		clearArcFolder()
+	end
+
+	local trajectory = prediction and prediction.Trajectory
+
+	if typeof(trajectory) ~= "table" or #trajectory <= 0 then
+		return
+	end
+
+	local folder = getArcFolder()
+	local hasHit = prediction.HitPart ~= nil or prediction.HitResult ~= nil
+	local segmentColor = hasHit and ARC_HIT_COLOR or ARC_COLOR
+
+	for index = 1, #trajectory - 1, ARC_VISUAL_STRIDE do
+		local a = trajectory[index]
+		local b = trajectory[math.min(index + ARC_VISUAL_STRIDE, #trajectory)]
+
+		if typeof(a) == "Vector3" and typeof(b) == "Vector3" then
+			local distance = (b - a).Magnitude
+
+			if distance > 0.001 then
+				local segment = makeArcPart(
+					"ArcSegment",
+					Vector3.new(ARC_THICKNESS, distance, ARC_THICKNESS),
+					segmentColor,
+					ARC_TRANSPARENCY
+				)
+
+				segment.Shape = Enum.PartType.Cylinder
+				segment.CFrame = getCylinderCFrameBetween(a, b)
+				segment.Parent = folder
+			end
+		end
+	end
+
+	for index = 1, #trajectory, math.max(ARC_VISUAL_STRIDE * 3, 1) do
+		local point = trajectory[index]
+
+		if typeof(point) == "Vector3" then
+			local dot = makeArcPart(
+				"ArcPoint",
+				Vector3.new(ARC_POINT_SIZE, ARC_POINT_SIZE, ARC_POINT_SIZE),
+				ARC_POINT_COLOR,
+				0.25
+			)
+
+			dot.Shape = Enum.PartType.Ball
+			dot.CFrame = CFrame.new(point)
+			dot.Parent = folder
+		end
+	end
+
+	local landingPosition = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
+
+	if typeof(landingPosition) == "Vector3" then
+		local marker = makeArcPart(
+			"LandingMarker",
+			Vector3.new(ARC_LANDING_MARKER_SIZE, ARC_LANDING_MARKER_SIZE, ARC_LANDING_MARKER_SIZE),
+			hasHit and ARC_HIT_COLOR or ARC_COLOR,
+			0.05
+		)
+
+		marker.Shape = Enum.PartType.Ball
+		marker.CFrame = CFrame.new(landingPosition)
+		marker.Parent = folder
+	end
+end
 
 local function isPositiveNumber(value)
 	return typeof(value) == "number" and value > 0
@@ -245,6 +407,8 @@ local function castAlongPath(position, displacement, castInfo, raycastParams)
 end
 
 local function returnPrediction(prediction)
+	drawTrajectoryArc(prediction)
+
 	return prediction.Trajectory, prediction.HitPart, prediction.HitResult, prediction
 end
 

@@ -996,29 +996,52 @@ local function findSafeRedirect(prediction, danger)
 		end
 	end
 
-	local horizSpeed = math.clamp(
+	-- Preserve as much of the original speed as possible, only escalate if needed
+	local naturalSpeed = math.max(horizVel.Magnitude, 8)
+	local fullSpeed    = math.clamp(
 		math.max(horizVel.Magnitude, CONFIG.RedirectHorizontalSpeed),
 		CONFIG.RedirectHorizontalSpeed,
 		CONFIG.RedirectMaxHorizontalSpeed
 	)
-	local liftY = math.max(currentVel.Y, 0) + CONFIG.RedirectLift + CONFIG.ExtraArcLift
 
 	local angles = { 0 }
-	local deg    = CONFIG.SafePathAngleStep
+	local deg = CONFIG.SafePathAngleStep
 	while deg <= CONFIG.SafePathMaxAngle do
 		table.insert(angles, deg)
 		table.insert(angles, -deg)
 		deg += CONFIG.SafePathAngleStep
 	end
 
+	-- Pass 1: Natural speed, no added lift — closest to original arc
 	for _, angle in ipairs(angles) do
 		local dir          = rotateY(baseDir, angle)
-		local candidateVel = dir * horizSpeed + Vector3.new(0, liftY, 0)
+		local candidateVel = dir * naturalSpeed + Vector3.new(0, currentVel.Y, 0)
 		if simulateCandidateSafe(startPos, candidateVel) then
 			return candidateVel, angle
 		end
 	end
 
+	-- Pass 2: Natural speed, small lift — gentle correction
+	local smallLift = math.max(currentVel.Y, 0) + CONFIG.RedirectLift * 0.35
+	for _, angle in ipairs(angles) do
+		local dir          = rotateY(baseDir, angle)
+		local candidateVel = dir * naturalSpeed + Vector3.new(0, smallLift, 0)
+		if simulateCandidateSafe(startPos, candidateVel) then
+			return candidateVel, angle
+		end
+	end
+
+	-- Pass 3: Full speed, full lift — original fallback behavior
+	local fullLift = math.max(currentVel.Y, 0) + CONFIG.RedirectLift + CONFIG.ExtraArcLift
+	for _, angle in ipairs(angles) do
+		local dir          = rotateY(baseDir, angle)
+		local candidateVel = dir * fullSpeed + Vector3.new(0, fullLift, 0)
+		if simulateCandidateSafe(startPos, candidateVel) then
+			return candidateVel, angle
+		end
+	end
+
+	-- Emergency: last resort only
 	if CONFIG.EmergencyRedirectEnabled then
 		local away = getNearestAcidDirectionAway(startPos) or safeHorizontalUnit(rootPart.CFrame.LookVector)
 		return away * CONFIG.EmergencyHorizontalSpeed + Vector3.new(0, CONFIG.EmergencyLift, 0), nil
@@ -1058,6 +1081,10 @@ end
 
 local function runPredictionCycle()
 	if not Controller.Enabled or not rootPart or not rootPart.Parent then return end
+
+	if safePathFound and os.clock() - safePathFoundAt <= CONFIG.SafePathCommitWindow then
+		return
+	end
 
 	local ragdoll = isRagdolled()
 

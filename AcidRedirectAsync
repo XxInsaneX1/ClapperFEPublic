@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------
--- AcidPit / Acid-only Trajectory Redirect v7 (Optimized)
+-- AcidPit / Acid-only Trajectory Redirect v7 (Optimized & Fully Fixed)
 -- Acid-only · ragdoll redirect · reliable safe-path sweep
 --------------------------------------------------------------------------
 
@@ -80,7 +80,7 @@ local CONFIG = {
 	MaxMagnusAcceleration = 45,
 
 	-- Safe path sweep.
-	SafePathSweepTimeStep = 1 / 24,
+	SafePathSweepTimeStep = 1 / 20, -- Optimized candidate timestep size
 	SafePathSweepMaxTime  = 1.8,
 	SafePathAngleStep     = 10,
 	SafePathMaxAngle      = 180,
@@ -288,7 +288,7 @@ local broadOverlapParams = OverlapParams.new()
 
 local acidParts       = {}
 local acidPartSet     = {}
-local acidCheckCache  = setmetatable({}, { __mode = "k" }) -- Weak-keys layout prevents memory leaks
+local acidCheckCache  = setmetatable({}, { __mode = "k" }) 
 local connections     = {}
 
 local heartbeatConnection = nil
@@ -467,7 +467,6 @@ local function isAcidInstance(instance)
 		return true
 	end
 
-	-- Memoized lookup dictionary to prevent climbing tree hierarchies on frame tasks.
 	if acidCheckCache[instance] ~= nil then
 		return acidCheckCache[instance]
 	end
@@ -539,7 +538,6 @@ local function rebuildAcidParts()
 	end
 end
 
--- Debounced rebuild call ensures multiple fast stream loads do not stack lag spikes.
 local rebuildPending = false
 local function queueRebuild()
 	if rebuildPending then return end
@@ -632,7 +630,6 @@ local function getAcidNearPoint(point, radius)
 		end
 	end
 
-	-- Fallback broad scan (acid-only).
 	local ok, parts = pcall(function()
 		return Workspace:GetPartBoundsInRadius(point, math.max(radius, 9), broadOverlapParams)
 	end)
@@ -1109,10 +1106,10 @@ local function getPredictionAcidDanger(prediction)
 end
 
 ------------------------------------------------------------------------
--- Safe path / redirect
+-- Safe path / redirect (Accounts for Air, Landing, & Slide Danger phases)
 ------------------------------------------------------------------------
 
-local function testTrajectoryIsSafe(startVelocity)
+local function testTrajectoryAndSlideIsSafe(startVelocity)
 	if not rootPart or not rootPart.Parent then return false end
 
 	local position = rootPart.Position
@@ -1121,9 +1118,13 @@ local function testTrajectoryIsSafe(startVelocity)
 	local gravity = Vector3.new(0, -Workspace.Gravity, 0)
 	local elapsed = 0
 
-	while elapsed < CONFIG.SafePathSweepMaxTime do
-		if not rootPart.Parent then return false end
+	local trajectoryHitPart = nil
+	local trajectoryHitResult = nil
+	local endPosition = position
+	local endVelocity = velocity
 
+	-- Phase 1: Airborne Projection Sweep
+	while elapsed < CONFIG.SafePathSweepMaxTime do
 		local step = math.min(CONFIG.SafePathSweepTimeStep, CONFIG.SafePathSweepMaxTime - elapsed)
 		local acceleration = gravity + getDragAcceleration(velocity) + getMagnusAcceleration(velocity, angularVelocity)
 		local nextVelocity = velocity + acceleration * step
@@ -1132,7 +1133,6 @@ local function testTrajectoryIsSafe(startVelocity)
 
 		if displacement.Magnitude > 0.001 then
 			local hitResult
-
 			local castOk, castResult = pcall(function()
 				return Workspace:Spherecast(position, CONFIG.CharacterRadius, displacement, raycastParams)
 			end)
@@ -1144,7 +1144,12 @@ local function testTrajectoryIsSafe(startVelocity)
 			end
 
 			if hitResult then
-				return not isAcidInstance(hitResult.Instance)
+				local alpha = math.clamp(hitResult.Distance / displacement.Magnitude, 0, 1)
+				endPosition = position:Lerp(nextPosition, alpha)
+				endVelocity = velocity:Lerp(nextVelocity, alpha)
+				trajectoryHitResult = hitResult
+				trajectoryHitPart = hitResult.Instance
+				break
 			end
 		end
 
@@ -1155,9 +1160,95 @@ local function testTrajectoryIsSafe(startVelocity)
 		position = nextPosition
 		velocity = nextVelocity
 		elapsed += step
+		endPosition = nextPosition
+		endVelocity = nextVelocity
 	end
 
-	return getAcidNearPoint(position, CONFIG.TrajectoryAcidRadius) == nil
+	-- Direct Airborne Contact Verification
+	if trajectoryHitPart then
+		if isAcidInstance(trajectoryHitPart) then
+			return false
+		end
+	else
+		-- Airborne path reached max bounds without structural collision; check terminal proximity.
+		if getAcidNearPoint(endPosition, CONFIG.TrajectoryAcidRadius) then
+			return false
+		end
+	end
+
+	-- Phase 2: Slide Projection Landing Sweep
+	if CONFIG.EnableSlidePrediction and CONFIG.EnableRagdollSlidePrediction then
+		local groundHit = trajectoryHitResult or getGroundHit(endPosition)
+
+		if groundHit then
+			if isAcidInstance(groundHit.Instance) then
+				return false
+			end
+
+			local normal = groundHit.Normal
+			local slidePos = groundHit.Position
+			local slideVelocity = getSurfaceVelocity(endVelocity, normal)
+			local slideElapsed = 0
+
+			if normal.Y > 0.05 then
+				while slideElapsed < CONFIG.SlideLookahead do
+					local step = math.min(CONFIG.SlideTimeStep, CONFIG.SlideLookahead - slideElapsed)
+
+					local gravityAcc = Vector3.new(0, -Workspace.Gravity, 0)
+					local slopeAcceleration = gravityAcc - normal * gravityAcc:Dot(normal)
+					local normalAcceleration = math.max(-gravityAcc:Dot(normal), 0)
+					local surfaceFriction = getSurfaceFriction(groundHit.Instance)
+					local kineticFriction = surfaceFriction * CONFIG.RagdollFrictionMultiplier
+					local staticFriction = kineticFriction * CONFIG.StaticFrictionMultiplier
+
+					if slideVelocity.Magnitude < CONFIG.MinSlideSpeed
+						and slopeAcceleration.Magnitude <= staticFriction * normalAcceleration then
+						break
+					end
+
+					slideVelocity += slopeAcceleration * step
+
+					if slideVelocity.Magnitude > 0.001 then
+						local frictionMag = math.min(
+							kineticFriction * normalAcceleration,
+							slideVelocity.Magnitude / step
+						)
+						slideVelocity -= slideVelocity.Unit * frictionMag * step
+					end
+
+					if slideVelocity.Magnitude > CONFIG.MaxSlideSpeed then
+						slideVelocity = slideVelocity.Unit * CONFIG.MaxSlideSpeed
+					end
+
+					if slideVelocity.Magnitude < 0.25 and slopeAcceleration.Magnitude < CONFIG.MinSlideSpeed then
+						break
+					end
+
+					slidePos += slideVelocity * step
+
+					if getAcidNearPoint(slidePos, CONFIG.SlideDangerRadius) then
+						return false
+					end
+
+					groundHit = getGroundHit(slidePos + normal * CONFIG.SlideSurfaceOffset)
+					if not groundHit then
+						break
+					end
+
+					if isAcidInstance(groundHit.Instance) then
+						return false
+					end
+
+					normal = groundHit.Normal
+					slidePos = groundHit.Position + normal * CONFIG.SlideSurfaceOffset
+					slideVelocity = getSurfaceVelocity(slideVelocity, normal)
+					slideElapsed += step
+				end
+			end
+		end
+	end
+
+	return true
 end
 
 local function findSafePath()
@@ -1166,25 +1257,13 @@ local function findSafePath()
 	local currentVelocity = rootPart.AssemblyLinearVelocity
 	local currentHorizontal = getHorizontal(currentVelocity)
 
+	-- Keep baseDirection purely aligned with the active movement trajectory / arc path
 	local baseDirection
-
-	if currentHorizontal.Magnitude > 0.001 then
+	if currentHorizontal.Magnitude > 0.01 then
 		baseDirection = currentHorizontal.Unit
 	else
 		local look = getHorizontal(rootPart.CFrame.LookVector)
-		baseDirection = look.Magnitude > 0.001 and look.Unit or Vector3.new(1, 0, 0)
-	end
-
-	local awayDirection = getNearestAcidDirectionAway(rootPart.Position)
-
-	if awayDirection and awayDirection.Magnitude > 0.001 then
-		baseDirection = (baseDirection * 0.35 + awayDirection * 0.65)
-
-		if baseDirection.Magnitude > 0.001 then
-			baseDirection = baseDirection.Unit
-		else
-			baseDirection = awayDirection.Unit
-		end
+		baseDirection = look.Magnitude > 0.01 and look.Unit or Vector3.new(1, 0, 0)
 	end
 
 	local horizontalSpeed = math.clamp(
@@ -1199,6 +1278,7 @@ local function findSafePath()
 		verticalSpeed = math.max(verticalSpeed, CONFIG.RedirectLift + 8)
 	end
 
+	-- Sweep out immediately from 0 degrees (exact travel path center representation)
 	for _, angleDeg in ipairs(SWEEP_ANGLES) do
 		local angle = math.rad(angleDeg)
 		local cosA = math.cos(angle)
@@ -1218,7 +1298,8 @@ local function findSafePath()
 
 		local testVelocity = testDir * horizontalSpeed + Vector3.new(0, verticalSpeed, 0)
 
-		if testTrajectoryIsSafe(testVelocity) then
+		-- Verify candidate safety profile inclusive of slide risk
+		if testTrajectoryAndSlideIsSafe(testVelocity) then
 			return testDir, testVelocity
 		end
 	end
@@ -1315,7 +1396,6 @@ local function updateAcidCache(deltaTime)
 
 	cacheRebuildAccumulated = 0
 	
-	-- Only force-refresh if cache tracking drops clean in high configurations.
 	if CONFIG.EnableWorkspaceAcidCache and #acidParts == 0 then
 		queueRebuild()
 	end
@@ -1623,7 +1703,7 @@ table.insert(connections, Workspace.DescendantAdded:Connect(function(inst)
 end))
 
 table.insert(connections, Workspace.DescendantRemoving:Connect(function(inst)
-	acidCheckCache[inst] = nil -- Free descriptor references on destruction
+	acidCheckCache[inst] = nil 
 	if acidPartSet[inst] then
 		queueRebuild()
 	elseif inst == acidPitFolder then

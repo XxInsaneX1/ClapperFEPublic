@@ -1,6 +1,6 @@
 --------------------------------------------------------------------------
--- AntiFling -- core protection + sleek black settings GUI
--- Synced with AcidRedirect + Trajectory API
+-- AntiFling Loader / GUI
+-- Loads Trajectory API + AcidRedirect API separately
 --------------------------------------------------------------------------
 
 local Players = game:GetService("Players")
@@ -11,14 +11,11 @@ local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-
-local global = if getgenv then getgenv() else _G
+local global = getgenv and getgenv() or _G
 
 if global.__AntiFlingGuiController and typeof(global.__AntiFlingGuiController.Destroy) == "function" then
 	pcall(global.__AntiFlingGuiController.Destroy)
 end
-
-local MainConnections = {}
 
 local TRAJECTORY_API_URL = "https://raw.githubusercontent.com/XxInsaneX1/ClapperFEPublic/refs/heads/main/TJFPublicRelease"
 local ACID_REDIRECT_API_URL = "https://raw.githubusercontent.com/XxInsaneX1/ClapperFEPublic/refs/heads/main/AcidRedirectAsync"
@@ -52,11 +49,26 @@ local AcidRedirect = {
 	LastError = nil,
 }
 
-local EPSILON = 0.01
-
+local MainConnections = {}
 local Character, Humanoid, RootPart
 local ragdolled = false
 local characterConnections = {}
+
+local COLOR_BG = Color3.fromRGB(14, 14, 16)
+local COLOR_PANEL = Color3.fromRGB(18, 18, 21)
+local COLOR_FIELD = Color3.fromRGB(26, 26, 30)
+local COLOR_BORDER = Color3.fromRGB(38, 38, 43)
+local COLOR_TEXT = Color3.fromRGB(235, 235, 238)
+local COLOR_SUBTEXT = Color3.fromRGB(150, 150, 158)
+local COLOR_ACCENT = Color3.fromRGB(255, 255, 255)
+
+local function create(className, props)
+	local inst = Instance.new(className)
+	for prop, value in pairs(props) do
+		inst[prop] = value
+	end
+	return inst
+end
 
 local function isRagdollState(state)
 	return state == Enum.HumanoidStateType.Physics
@@ -69,19 +81,17 @@ local function getAcidController()
 end
 
 local function isAcidRedirecting()
-	local controller = getAcidController()
-
 	if not AcidRedirect.Enabled then
 		return false
 	end
 
+	local controller = getAcidController()
 	if typeof(controller) ~= "table" then
 		return false
 	end
 
 	if typeof(controller.IsRedirecting) == "function" then
 		local ok, result = pcall(controller.IsRedirecting)
-
 		if ok then
 			return result == true
 		end
@@ -95,15 +105,11 @@ local function getMaxUpwardVelocity()
 		return 0
 	end
 
-	local jumpVelocity
-
 	if Humanoid.UseJumpPower then
-		jumpVelocity = Humanoid.JumpPower
-	else
-		jumpVelocity = math.sqrt(2 * Workspace.Gravity * Humanoid.JumpHeight)
+		return Humanoid.JumpPower * Settings.JumpVelocityBuffer
 	end
 
-	return jumpVelocity * Settings.JumpVelocityBuffer
+	return math.sqrt(2 * Workspace.Gravity * Humanoid.JumpHeight) * Settings.JumpVelocityBuffer
 end
 
 local function clampVelocity()
@@ -116,30 +122,23 @@ local function clampVelocity()
 	end
 
 	local velocity = RootPart.AssemblyLinearVelocity
-	local redirectingFromAcid = isAcidRedirecting()
-
 	local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
 	local maxHorizontal = Humanoid.WalkSpeed * Settings.HorizontalMultiplier
 
-	if redirectingFromAcid then
+	if isAcidRedirecting() then
 		maxHorizontal = math.max(maxHorizontal, 100)
 	end
 
 	local newHorizontal = horizontal
-
 	if horizontal.Magnitude > maxHorizontal then
-		if horizontal.Magnitude > 0 then
-			newHorizontal = horizontal.Unit * maxHorizontal
-		else
-			newHorizontal = Vector3.zero
-		end
+		newHorizontal = horizontal.Magnitude > 0 and horizontal.Unit * maxHorizontal or Vector3.zero
 	end
 
 	local maxUpward = getMaxUpwardVelocity()
 	local minDownward = -math.huge
 
 	if ragdolled then
-		if redirectingFromAcid then
+		if isAcidRedirecting() then
 			maxUpward = math.max(maxUpward, 36)
 		else
 			maxUpward = math.min(maxUpward, Settings.RagdollMaxUpward)
@@ -148,15 +147,17 @@ local function clampVelocity()
 		minDownward = Settings.RagdollMaxDownward
 	end
 
-	local y = math.clamp(velocity.Y, minDownward, maxUpward)
-	local newVelocity = Vector3.new(newHorizontal.X, y, newHorizontal.Z)
+	local newVelocity = Vector3.new(
+		newHorizontal.X,
+		math.clamp(velocity.Y, minDownward, maxUpward),
+		newHorizontal.Z
+	)
 
-	if (newVelocity - velocity).Magnitude > EPSILON then
+	if (newVelocity - velocity).Magnitude > 0.01 then
 		RootPart.AssemblyLinearVelocity = newVelocity
 	end
 
 	local angular = RootPart.AssemblyAngularVelocity
-
 	if angular.Magnitude > Settings.MaxAngularSpeed then
 		RootPart.AssemblyAngularVelocity = angular * Settings.AngularDamping
 	end
@@ -177,8 +178,12 @@ end
 local function setupCharacter(character)
 	teardownCharacter()
 
-	local humanoid = character:WaitForChild("Humanoid")
-	local rootPart = character:WaitForChild("HumanoidRootPart")
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+
+	if not humanoid or not rootPart then
+		return
+	end
 
 	Character = character
 	Humanoid = humanoid
@@ -207,45 +212,6 @@ end
 table.insert(MainConnections, LocalPlayer.CharacterAdded:Connect(setupCharacter))
 table.insert(MainConnections, RunService.Heartbeat:Connect(clampVelocity))
 
-local COLOR_BG = Color3.fromRGB(14, 14, 16)
-local COLOR_PANEL = Color3.fromRGB(18, 18, 21)
-local COLOR_FIELD = Color3.fromRGB(26, 26, 30)
-local COLOR_BORDER = Color3.fromRGB(38, 38, 43)
-local COLOR_TEXT = Color3.fromRGB(235, 235, 238)
-local COLOR_SUBTEXT = Color3.fromRGB(140, 140, 148)
-local COLOR_ACCENT = Color3.fromRGB(255, 255, 255)
-
-local PANEL_WIDTH = 300
-local PANEL_HEIGHT = 436
-
-local function create(className, props)
-	local inst = Instance.new(className)
-
-	for prop, value in pairs(props) do
-		inst[prop] = value
-	end
-
-	return inst
-end
-
-local function flash(stroke)
-	local original = stroke.Color
-	stroke.Color = COLOR_ACCENT
-	TweenService:Create(stroke, TweenInfo.new(0.35), { Color = original }):Play()
-end
-
-local function sanitize(value, minVal, maxVal)
-	if value < minVal then
-		value = minVal
-	end
-
-	if value > maxVal then
-		value = maxVal
-	end
-
-	return value
-end
-
 local gui = create("ScreenGui", {
 	Name = "AntiFlingGui",
 	ResetOnSpawn = false,
@@ -253,33 +219,32 @@ local gui = create("ScreenGui", {
 	Parent = PlayerGui,
 })
 
-local notificationStack = create("Frame", {
+local notifications = create("Frame", {
 	Name = "Notifications",
 	Parent = gui,
 	AnchorPoint = Vector2.new(1, 0),
 	Position = UDim2.new(1, -18, 0, 18),
-	Size = UDim2.fromOffset(250, 320),
+	Size = UDim2.fromOffset(260, 330),
 	BackgroundTransparency = 1,
 })
 
 create("UIListLayout", {
-	Parent = notificationStack,
+	Parent = notifications,
 	SortOrder = Enum.SortOrder.LayoutOrder,
 	Padding = UDim.new(0, 8),
 	HorizontalAlignment = Enum.HorizontalAlignment.Right,
-	VerticalAlignment = Enum.VerticalAlignment.Top,
 })
 
-local notificationCount = 0
+local notifyIndex = 0
 
 local function notify(titleText, bodyText, duration)
-	notificationCount += 1
+	notifyIndex += 1
 
 	local toast = create("CanvasGroup", {
 		Name = "Toast",
-		Parent = notificationStack,
-		LayoutOrder = -notificationCount,
-		Size = UDim2.fromOffset(250, 68),
+		Parent = notifications,
+		LayoutOrder = -notifyIndex,
+		Size = UDim2.fromOffset(260, 72),
 		BackgroundColor3 = COLOR_PANEL,
 		BorderSizePixel = 0,
 		GroupTransparency = 1,
@@ -294,7 +259,7 @@ local function notify(titleText, bodyText, duration)
 		Position = UDim2.fromOffset(14, 10),
 		Size = UDim2.new(1, -28, 0, 16),
 		Font = Enum.Font.GothamBold,
-		Text = titleText,
+		Text = tostring(titleText),
 		TextColor3 = COLOR_TEXT,
 		TextSize = 12,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -305,9 +270,9 @@ local function notify(titleText, bodyText, duration)
 		Parent = toast,
 		BackgroundTransparency = 1,
 		Position = UDim2.fromOffset(14, 30),
-		Size = UDim2.new(1, -28, 0, 28),
+		Size = UDim2.new(1, -28, 0, 32),
 		Font = Enum.Font.Gotham,
-		Text = bodyText,
+		Text = tostring(bodyText),
 		TextColor3 = COLOR_SUBTEXT,
 		TextSize = 11,
 		TextWrapped = true,
@@ -324,12 +289,257 @@ local function notify(titleText, bodyText, duration)
 
 		local tween = TweenService:Create(toast, TweenInfo.new(0.16), { GroupTransparency = 1 })
 		tween:Play()
-
 		tween.Completed:Connect(function()
 			if toast.Parent then
 				toast:Destroy()
 			end
 		end)
+	end)
+end
+
+local function loadRemoteChunk(url)
+	local httpOk, source = pcall(function()
+		return game:HttpGet(url)
+	end)
+
+	if not httpOk then
+		return nil, tostring(source)
+	end
+
+	if typeof(source) ~= "string" or source == "" then
+		return nil, "empty source returned from " .. tostring(url)
+	end
+
+	local chunk, compileError = loadstring(source)
+	if not chunk then
+		return nil, compileError or "loadstring failed"
+	end
+
+	return chunk, nil
+end
+
+local function checkTrajectoryApi()
+	local chunk, loadError = loadRemoteChunk(TRAJECTORY_API_URL)
+	if not chunk then
+		return false, loadError, nil
+	end
+
+	local ok, predictorOrError = pcall(chunk)
+	if not ok then
+		return false, predictorOrError, nil
+	end
+
+	if typeof(predictorOrError) ~= "function" then
+		return false, "Trajectory API did not return a function", nil
+	end
+
+	local predictOk, _, _, _, predictionData = pcall(
+		predictorOrError,
+		LocalPlayer,
+		{
+			MaxTime = 0.25,
+			TimeStep = 1 / 60,
+			CastMode = "Sphere",
+			CastRadius = 1.65,
+			DrawArc = false,
+		}
+	)
+
+	if not predictOk then
+		return false, predictionData, nil
+	end
+
+	if typeof(predictionData) ~= "table" then
+		return false, "Trajectory API returned no prediction table", nil
+	end
+
+	return true, nil, predictorOrError
+end
+
+local acidStatusLabel
+local acidToggleSetState
+
+local function setAcidStatus(text, active)
+	if acidStatusLabel then
+		acidStatusLabel.Text = text
+		acidStatusLabel.TextColor3 = active and COLOR_TEXT or COLOR_SUBTEXT
+	end
+end
+
+local function stopAcidRedirect()
+	AcidRedirect.LoadToken += 1
+
+	local controller = AcidRedirect.Controller or global.__AcidRedirectController
+
+	if controller then
+		if typeof(controller.HideArc) == "function" then
+			pcall(controller.HideArc)
+		end
+
+		if typeof(controller.Destroy) == "function" then
+			pcall(controller.Destroy)
+		elseif typeof(controller.Stop) == "function" then
+			pcall(controller.Stop)
+		end
+	end
+
+	if global.__AcidRedirectController == controller then
+		global.__AcidRedirectController = nil
+	end
+
+	AcidRedirect.Enabled = false
+	AcidRedirect.Loading = false
+	AcidRedirect.Loaded = false
+	AcidRedirect.Controller = nil
+	AcidRedirect.Predictor = nil
+	AcidRedirect.LastError = nil
+
+	setAcidStatus("Disabled", false)
+	notify("Acid-Redirect", "Stopped.")
+end
+
+local function startAcidRedirect()
+	if AcidRedirect.Loaded then
+		local controller = AcidRedirect.Controller or global.__AcidRedirectController
+
+		if controller and typeof(controller.Start) == "function" then
+			pcall(controller.Start)
+		end
+
+		if controller and typeof(controller.ShowArc) == "function" then
+			pcall(controller.ShowArc)
+		end
+
+		AcidRedirect.Enabled = true
+		setAcidStatus("Active", true)
+		notify("Acid-Redirect", "Already active.")
+		return
+	end
+
+	if AcidRedirect.Loading then
+		notify("Acid-Redirect", "Still loading.")
+		return
+	end
+
+	AcidRedirect.Enabled = true
+	AcidRedirect.Loading = true
+	AcidRedirect.LoadToken += 1
+	AcidRedirect.LastError = nil
+
+	local loadToken = AcidRedirect.LoadToken
+
+	setAcidStatus("Loading APIs...", true)
+	notify("Acid-Redirect", "Checking trajectory and redirect APIs.")
+
+	task.spawn(function()
+		local trajectoryOk, trajectoryError, predictor = checkTrajectoryApi()
+
+		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
+			return
+		end
+
+		if not trajectoryOk then
+			AcidRedirect.Enabled = false
+			AcidRedirect.Loading = false
+			AcidRedirect.LastError = tostring(trajectoryError)
+			setAcidStatus("Trajectory failed", false)
+
+			if acidToggleSetState then
+				acidToggleSetState(false, true)
+			end
+
+			notify("Acid-Redirect", "Trajectory API failed: " .. AcidRedirect.LastError, 5)
+			return
+		end
+
+		AcidRedirect.Predictor = predictor
+
+		local redirectChunk, redirectError = loadRemoteChunk(ACID_REDIRECT_API_URL)
+
+		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
+			return
+		end
+
+		if not redirectChunk then
+			AcidRedirect.Enabled = false
+			AcidRedirect.Loading = false
+			AcidRedirect.LastError = tostring(redirectError)
+			setAcidStatus("Redirect failed", false)
+
+			if acidToggleSetState then
+				acidToggleSetState(false, true)
+			end
+
+			notify("Acid-Redirect", "Redirect API failed: " .. AcidRedirect.LastError, 5)
+			return
+		end
+
+		local ok, resultOrError = pcall(redirectChunk, {
+			PredictPlayerLanding = predictor,
+			ShowTrajectoryArc = true,
+			Notify = function(titleText, bodyText, duration)
+				notify(titleText, bodyText, duration)
+			end,
+			Config = {
+				ShowTrajectoryArc = true,
+				ClearArcWhenIdle = true,
+				EnableKeywordHazardDetection = true,
+				EnableBroadHazardScan = true,
+				EnableSlidePrediction = true,
+				EnableRagdollSlidePrediction = true,
+				EnableStandingSlidePrediction = false,
+				EnableStandingVelocitySlidePrediction = false,
+			},
+		})
+
+		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
+			return
+		end
+
+		if not ok then
+			AcidRedirect.Enabled = false
+			AcidRedirect.Loading = false
+			AcidRedirect.LastError = tostring(resultOrError)
+			setAcidStatus("Runtime failed", false)
+
+			if acidToggleSetState then
+				acidToggleSetState(false, true)
+			end
+
+			notify("Acid-Redirect", "Runtime failed: " .. AcidRedirect.LastError, 5)
+			return
+		end
+
+		local controller = typeof(resultOrError) == "table" and resultOrError or global.__AcidRedirectController
+
+		if typeof(controller) ~= "table" then
+			AcidRedirect.Enabled = false
+			AcidRedirect.Loading = false
+			AcidRedirect.LastError = "Redirect API did not return a controller"
+			setAcidStatus("No controller", false)
+
+			if acidToggleSetState then
+				acidToggleSetState(false, true)
+			end
+
+			notify("Acid-Redirect", AcidRedirect.LastError, 5)
+			return
+		end
+
+		if typeof(controller.SetPredictor) == "function" then
+			pcall(controller.SetPredictor, predictor)
+		end
+
+		if typeof(controller.ShowArc) == "function" then
+			pcall(controller.ShowArc)
+		end
+
+		AcidRedirect.Loading = false
+		AcidRedirect.Loaded = true
+		AcidRedirect.Controller = controller
+
+		setAcidStatus("Active", true)
+		notify("Acid-Redirect", "Active. Hazard detection and redirect are running.")
 	end)
 end
 
@@ -351,30 +561,22 @@ local toggleButton = create("TextButton", {
 create("UICorner", { Parent = toggleButton, CornerRadius = UDim.new(1, 0) })
 create("UIStroke", { Parent = toggleButton, Color = COLOR_BORDER, Thickness = 1 })
 
-toggleButton.MouseEnter:Connect(function()
-	TweenService:Create(toggleButton, TweenInfo.new(0.12), { BackgroundColor3 = COLOR_FIELD }):Play()
-end)
-
-toggleButton.MouseLeave:Connect(function()
-	TweenService:Create(toggleButton, TweenInfo.new(0.12), { BackgroundColor3 = COLOR_PANEL }):Play()
-end)
-
 local panel = create("CanvasGroup", {
 	Name = "Panel",
 	Parent = gui,
-	Size = UDim2.fromOffset(PANEL_WIDTH, PANEL_HEIGHT),
+	Size = UDim2.fromOffset(300, 436),
 	AnchorPoint = Vector2.new(0, 0.5),
 	Position = UDim2.new(0, 72, 0.5, 0),
 	BackgroundColor3 = COLOR_BG,
 	BorderSizePixel = 0,
 	Visible = false,
+	GroupTransparency = 1,
 })
 
 create("UICorner", { Parent = panel, CornerRadius = UDim.new(0, 14) })
 create("UIStroke", { Parent = panel, Color = COLOR_BORDER, Thickness = 1 })
 
 local header = create("Frame", {
-	Name = "Header",
 	Parent = panel,
 	Size = UDim2.new(1, 0, 0, 44),
 	BackgroundTransparency = 1,
@@ -403,21 +605,6 @@ local statusLabel = create("TextLabel", {
 	TextColor3 = COLOR_SUBTEXT,
 	TextSize = 11,
 	TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-create("Frame", {
-	Parent = panel,
-	Position = UDim2.fromOffset(16, 44),
-	Size = UDim2.new(1, -32, 0, 1),
-	BackgroundColor3 = COLOR_BORDER,
-	BorderSizePixel = 0,
-})
-
-local body = create("Frame", {
-	Parent = panel,
-	Position = UDim2.fromOffset(0, 53),
-	Size = UDim2.new(1, 0, 1, -53),
-	BackgroundTransparency = 1,
 })
 
 local function createToggle(parent, initial, onChanged)
@@ -454,10 +641,8 @@ local function createToggle(parent, initial, onChanged)
 	local function setState(nextState, skipCallback)
 		state = nextState
 
-		local pos = state and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
-
 		TweenService:Create(knob, TweenInfo.new(0.15), {
-			Position = pos,
+			Position = state and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8),
 			BackgroundColor3 = state and COLOR_ACCENT or COLOR_SUBTEXT,
 		}):Play()
 
@@ -483,357 +668,17 @@ end)
 masterToggle.AnchorPoint = Vector2.new(1, 0.5)
 masterToggle.Position = UDim2.new(1, -16, 0.5, 0)
 
-local acidToggleSetState = nil
-local acidStatusLabel = nil
-
-local function setAcidStatus(text, active)
-	if acidStatusLabel then
-		acidStatusLabel.Text = text
-		acidStatusLabel.TextColor3 = active and COLOR_TEXT or COLOR_SUBTEXT
-	end
-end
-
-local function loadRemoteChunk(url)
-	local httpOk, source = pcall(function()
-		return game:HttpGet(url)
-	end)
-
-	if not httpOk then
-		return nil, source
-	end
-
-	local chunk, compileError = loadstring(source)
-
-	if not chunk then
-		return nil, compileError or "loadstring failed"
-	end
-
-	return chunk, nil
-end
-
-local function checkTrajectoryApi()
-	local chunk, loadError = loadRemoteChunk(TRAJECTORY_API_URL)
-
-	if not chunk then
-		return false, loadError, nil
-	end
-
-	local ok, predictorOrError = pcall(chunk)
-
-	if not ok then
-		return false, predictorOrError, nil
-	end
-
-	if typeof(predictorOrError) ~= "function" then
-		return false, "trajectory API did not return PredictPlayerLanding function", nil
-	end
-
-	local predictOk, trajectory, hitPart, hitResult, predictionData = pcall(
-		predictorOrError,
-		LocalPlayer,
-		{
-			MaxTime = 0.25,
-			TimeStep = 1 / 60,
-			CastMode = "Sphere",
-			CastRadius = 1.65,
-			DrawArc = false,
-		}
-	)
-
-	if not predictOk then
-		return false, trajectory, nil
-	end
-
-	if typeof(predictionData) ~= "table" then
-		return false, "trajectory API returned no prediction table", nil
-	end
-
-	return true, nil, predictorOrError
-end
-
-local function stopAcidRedirect()
-	local controller = AcidRedirect.Controller or global.__AcidRedirectController
-
-	if AcidRedirect.Loaded or AcidRedirect.Loading or AcidRedirect.Enabled or controller then
-		AcidRedirect.LoadToken += 1
-
-		if controller then
-			if typeof(controller.HideArc) == "function" then
-				pcall(controller.HideArc)
-			elseif typeof(controller.ClearArc) == "function" then
-				pcall(controller.ClearArc)
-			end
-
-			if typeof(controller.Destroy) == "function" then
-				pcall(controller.Destroy)
-			elseif typeof(controller.Stop) == "function" then
-				pcall(controller.Stop)
-			end
-		end
-
-		if global.__AcidRedirectController == controller then
-			global.__AcidRedirectController = nil
-		end
-
-		AcidRedirect.Enabled = false
-		AcidRedirect.Loaded = false
-		AcidRedirect.Loading = false
-		AcidRedirect.Controller = nil
-		AcidRedirect.Predictor = nil
-		AcidRedirect.LastError = nil
-
-		setAcidStatus("Disabled", false)
-		notify("Acid-Redirect", "Stopped.")
-		return
-	end
-
-	AcidRedirect.Enabled = false
-	AcidRedirect.Loading = false
-	AcidRedirect.LoadToken += 1
-	AcidRedirect.Controller = nil
-	AcidRedirect.Predictor = nil
-	AcidRedirect.LastError = nil
-
-	setAcidStatus("Disabled", false)
-	notify("Acid-Redirect", "Disabled.")
-end
-
-local function startAcidRedirect()
-	if AcidRedirect.Loaded then
-		local controller = AcidRedirect.Controller or global.__AcidRedirectController
-
-		if controller and typeof(controller.Start) == "function" then
-			pcall(controller.Start)
-		end
-
-		if controller and typeof(controller.ShowArc) == "function" then
-			pcall(controller.ShowArc)
-		end
-
-		AcidRedirect.Enabled = true
-		setAcidStatus("Active", true)
-		notify("Acid-Redirect", "Already active and watching hazards.")
-		return
-	end
-
-	if AcidRedirect.Loading then
-		notify("Acid-Redirect", "Still loading the redirect service.")
-		return
-	end
-
-	AcidRedirect.Enabled = true
-	AcidRedirect.Loading = true
-	AcidRedirect.LoadToken += 1
-	AcidRedirect.LastError = nil
-
-	local loadToken = AcidRedirect.LoadToken
-
-	setAcidStatus("Loading APIs...", true)
-	notify("Acid-Redirect", "Checking trajectory tracker and redirect API.")
-
-	task.spawn(function()
-		local trajectoryOk, trajectoryError, predictor = checkTrajectoryApi()
-
-		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
-			return
-		end
-
-		if not trajectoryOk then
-			AcidRedirect.Enabled = false
-			AcidRedirect.Loading = false
-			AcidRedirect.Predictor = nil
-			AcidRedirect.LastError = tostring(trajectoryError)
-
-			setAcidStatus("Trajectory failed", false)
-
-			if acidToggleSetState then
-				acidToggleSetState(false, true)
-			end
-
-			notify("Acid-Redirect", "Trajectory API failed: " .. AcidRedirect.LastError, 5)
-			return
-		end
-
-		AcidRedirect.Predictor = predictor
-
-		local redirectChunk, redirectError = loadRemoteChunk(ACID_REDIRECT_API_URL)
-
-		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
-			return
-		end
-
-		if not redirectChunk then
-			AcidRedirect.Enabled = false
-			AcidRedirect.Loading = false
-			AcidRedirect.Predictor = nil
-			AcidRedirect.LastError = tostring(redirectError)
-
-			setAcidStatus("Redirect failed", false)
-
-			if acidToggleSetState then
-				acidToggleSetState(false, true)
-			end
-
-			notify("Acid-Redirect", "Redirect API failed: " .. AcidRedirect.LastError, 5)
-			return
-		end
-
-		local ok, resultOrError = pcall(redirectChunk, {
-			PredictPlayerLanding = predictor,
-			ShowTrajectoryArc = true,
-
-			Notify = function(titleText, bodyText, duration)
-				notify(titleText, bodyText, duration)
-			end,
-
-			Config = {
-				ShowTrajectoryArc = true,
-				ClearArcWhenIdle = true,
-
-				EnableKeywordHazardDetection = true,
-				EnableBroadHazardScan = true,
-
-				EnableSlidePrediction = true,
-				EnableStandingSlidePrediction = true,
-				EnableRagdollSlidePrediction = true,
-				EnableStandingVelocitySlidePrediction = true,
-			},
-		})
-
-		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then
-			return
-		end
-
-		if not ok then
-			AcidRedirect.Enabled = false
-			AcidRedirect.Loading = false
-			AcidRedirect.Predictor = nil
-			AcidRedirect.LastError = tostring(resultOrError)
-
-			setAcidStatus("Runtime failed", false)
-
-			if acidToggleSetState then
-				acidToggleSetState(false, true)
-			end
-
-			notify("Acid-Redirect", "Redirect runtime failed: " .. AcidRedirect.LastError, 5)
-			return
-		end
-
-		local returnedController = if typeof(resultOrError) == "table" then resultOrError else nil
-		local controller = returnedController or global.__AcidRedirectController
-
-		if typeof(controller) ~= "table" then
-			AcidRedirect.Enabled = false
-			AcidRedirect.Loading = false
-			AcidRedirect.Loaded = false
-			AcidRedirect.Controller = nil
-			AcidRedirect.Predictor = nil
-			AcidRedirect.LastError = "Redirect API did not return a controller table"
-
-			setAcidStatus("No controller", false)
-
-			if acidToggleSetState then
-				acidToggleSetState(false, true)
-			end
-
-			notify("Acid-Redirect", AcidRedirect.LastError, 5)
-			return
-		end
-
-		if typeof(controller.SetPredictor) == "function" then
-			pcall(controller.SetPredictor, predictor)
-		end
-
-		if typeof(controller.ShowArc) == "function" then
-			pcall(controller.ShowArc)
-		end
-
-		AcidRedirect.Loading = false
-		AcidRedirect.Loaded = true
-		AcidRedirect.Controller = controller
-
-		setAcidStatus("Active", true)
-		notify("Acid-Redirect", "Active. Synced trajectory, hazard detection, and redirects are running.")
-	end)
-end
-
-local loaderContainer = create("Frame", {
-	Name = "Loader",
-	Parent = body,
-	Size = UDim2.fromScale(1, 1),
-	BackgroundTransparency = 1,
-	Visible = true,
-})
-
-local ring = create("Frame", {
-	Name = "Ring",
-	Parent = loaderContainer,
-	Size = UDim2.fromOffset(34, 34),
-	AnchorPoint = Vector2.new(0.5, 0.5),
-	Position = UDim2.fromScale(0.5, 0.5),
+local content = create("Frame", {
+	Parent = panel,
+	Position = UDim2.fromOffset(16, 58),
+	Size = UDim2.new(1, -32, 1, -72),
 	BackgroundTransparency = 1,
 })
 
-create("UICorner", { Parent = ring, CornerRadius = UDim.new(1, 0) })
-
-local ringStroke = create("UIStroke", {
-	Parent = ring,
-	Color = COLOR_TEXT,
-	Thickness = 3,
-})
-
-create("UIGradient", {
-	Parent = ringStroke,
-	Color = ColorSequence.new(COLOR_TEXT),
-	Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0),
-		NumberSequenceKeypoint.new(0.85, 0.6),
-		NumberSequenceKeypoint.new(1, 1),
-	}),
-})
-
-local spinTween = nil
-
-local function startSpin()
-	ring.Rotation = 0
-
-	spinTween = TweenService:Create(
-		ring,
-		TweenInfo.new(0.9, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1, false),
-		{ Rotation = 360 }
-	)
-
-	spinTween:Play()
-end
-
-local function stopSpin()
-	if spinTween then
-		spinTween:Cancel()
-		spinTween = nil
-	end
-end
-
-local contentContainer = create("Frame", {
-	Name = "Content",
-	Parent = body,
-	Size = UDim2.fromScale(1, 1),
-	BackgroundTransparency = 1,
-	Visible = false,
-})
-
-create("UIPadding", {
-	Parent = contentContainer,
-	PaddingLeft = UDim.new(0, 16),
-	PaddingRight = UDim.new(0, 16),
-	PaddingTop = UDim.new(0, 14),
-	PaddingBottom = UDim.new(0, 14),
-})
-
-local function buildToggleRow(parent, yOffset, labelText, subText, initial, onChanged)
+local function buildToggleRow(y, label, sub, initial, callback)
 	local row = create("Frame", {
-		Parent = parent,
-		Position = UDim2.fromOffset(0, yOffset),
+		Parent = content,
+		Position = UDim2.fromOffset(0, y),
 		Size = UDim2.new(1, 0, 0, 38),
 		BackgroundTransparency = 1,
 	})
@@ -844,7 +689,7 @@ local function buildToggleRow(parent, yOffset, labelText, subText, initial, onCh
 		Position = UDim2.fromOffset(0, 1),
 		Size = UDim2.new(1, -54, 0, 16),
 		Font = Enum.Font.GothamBold,
-		Text = labelText,
+		Text = label,
 		TextColor3 = COLOR_TEXT,
 		TextSize = 12,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -856,23 +701,23 @@ local function buildToggleRow(parent, yOffset, labelText, subText, initial, onCh
 		Position = UDim2.fromOffset(0, 20),
 		Size = UDim2.new(1, -54, 0, 14),
 		Font = Enum.Font.Gotham,
-		Text = subText,
+		Text = sub,
 		TextColor3 = COLOR_SUBTEXT,
 		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
 	})
 
-	local toggle, setToggle = createToggle(row, initial, onChanged)
+	local toggle, setToggle = createToggle(row, initial, callback)
 	toggle.AnchorPoint = Vector2.new(1, 0.5)
 	toggle.Position = UDim2.new(1, 0, 0.5, 0)
 
-	return status, toggle, setToggle
+	return status, setToggle
 end
 
-local function buildRow(parent, yOffset, labelText, settingKey, minVal, maxVal)
+local function buildNumberRow(y, label, key, minValue, maxValue)
 	local row = create("Frame", {
-		Parent = parent,
-		Position = UDim2.fromOffset(0, yOffset),
+		Parent = content,
+		Position = UDim2.fromOffset(0, y),
 		Size = UDim2.new(1, 0, 0, 34),
 		BackgroundTransparency = 1,
 	})
@@ -882,76 +727,62 @@ local function buildRow(parent, yOffset, labelText, settingKey, minVal, maxVal)
 		BackgroundTransparency = 1,
 		Size = UDim2.new(0.58, 0, 1, 0),
 		Font = Enum.Font.Gotham,
-		Text = labelText,
+		Text = label,
 		TextColor3 = COLOR_SUBTEXT,
 		TextSize = 12,
 		TextXAlignment = Enum.TextXAlignment.Left,
 	})
 
-	local field = create("TextBox", {
+	local box = create("TextBox", {
 		Parent = row,
 		Position = UDim2.new(0.58, 8, 0, 0),
 		Size = UDim2.new(0.42, -8, 1, 0),
 		BackgroundColor3 = COLOR_FIELD,
 		BorderSizePixel = 0,
 		Font = Enum.Font.GothamMedium,
-		Text = tostring(Settings[settingKey]),
+		Text = tostring(Settings[key]),
 		TextColor3 = COLOR_TEXT,
 		TextSize = 12,
 		ClearTextOnFocus = false,
 		TextXAlignment = Enum.TextXAlignment.Center,
 	})
 
-	create("UICorner", { Parent = field, CornerRadius = UDim.new(0, 8) })
+	create("UICorner", { Parent = box, CornerRadius = UDim.new(0, 8) })
 
-	local fieldStroke = create("UIStroke", {
-		Parent = field,
-		Color = COLOR_BORDER,
-		Thickness = 1,
-	})
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
 
-	field.FocusLost:Connect(function()
-		local num = tonumber(field.Text)
-
-		if num then
-			num = sanitize(num, minVal, maxVal)
-			Settings[settingKey] = num
-			field.Text = tostring(num)
-			flash(fieldStroke)
+		if n then
+			n = math.clamp(n, minValue, maxValue)
+			Settings[key] = n
+			box.Text = tostring(n)
 		else
-			field.Text = tostring(Settings[settingKey])
+			box.Text = tostring(Settings[key])
 		end
 	end)
 
-	return field
+	return box
 end
 
-local acidToggleTrack
-
-acidStatusLabel, acidToggleTrack, acidToggleSetState = buildToggleRow(
-	contentContainer,
-	0,
-	"Acid-Redirect",
-	"Disabled",
-	AcidRedirect.Enabled,
-	function(state)
-		if state then
-			startAcidRedirect()
-		else
-			stopAcidRedirect()
-		end
+acidStatusLabel, acidToggleSetState = buildToggleRow(0, "Acid-Redirect", "Disabled", false, function(state)
+	if state then
+		startAcidRedirect()
+	else
+		stopAcidRedirect()
 	end
-)
+end)
 
-local horizontalField = buildRow(contentContainer, 48, "Horizontal Multiplier", "HorizontalMultiplier", 0, 5)
-local jumpBufferField = buildRow(contentContainer, 92, "Jump Velocity Buffer", "JumpVelocityBuffer", 0.1, 10)
-local ragdollUpField = buildRow(contentContainer, 136, "Ragdoll Max Upward", "RagdollMaxUpward", 0, 50)
-local ragdollDownField = buildRow(contentContainer, 180, "Ragdoll Max Downward", "RagdollMaxDownward", -2000, 0)
-local angularSpeedField = buildRow(contentContainer, 224, "Max Angular Speed", "MaxAngularSpeed", 0, 50)
-local angularDampingField = buildRow(contentContainer, 268, "Angular Damping", "AngularDamping", 0, 1)
+local fields = {
+	HorizontalMultiplier = buildNumberRow(48, "Horizontal Multiplier", "HorizontalMultiplier", 0, 5),
+	JumpVelocityBuffer = buildNumberRow(92, "Jump Velocity Buffer", "JumpVelocityBuffer", 0.1, 10),
+	RagdollMaxUpward = buildNumberRow(136, "Ragdoll Max Upward", "RagdollMaxUpward", 0, 50),
+	RagdollMaxDownward = buildNumberRow(180, "Ragdoll Max Downward", "RagdollMaxDownward", -2000, 0),
+	MaxAngularSpeed = buildNumberRow(224, "Max Angular Speed", "MaxAngularSpeed", 0, 50),
+	AngularDamping = buildNumberRow(268, "Angular Damping", "AngularDamping", 0, 1),
+}
 
 local resetButton = create("TextButton", {
-	Parent = contentContainer,
+	Parent = content,
 	Position = UDim2.fromOffset(0, 316),
 	Size = UDim2.new(1, 0, 0, 32),
 	BackgroundColor3 = COLOR_FIELD,
@@ -969,72 +800,31 @@ create("UIStroke", { Parent = resetButton, Color = COLOR_BORDER, Thickness = 1 }
 resetButton.MouseButton1Click:Connect(function()
 	for key, value in pairs(DEFAULTS) do
 		Settings[key] = value
+		if fields[key] then
+			fields[key].Text = tostring(value)
+		end
 	end
-
-	horizontalField.Text = tostring(DEFAULTS.HorizontalMultiplier)
-	jumpBufferField.Text = tostring(DEFAULTS.JumpVelocityBuffer)
-	ragdollUpField.Text = tostring(DEFAULTS.RagdollMaxUpward)
-	ragdollDownField.Text = tostring(DEFAULTS.RagdollMaxDownward)
-	angularSpeedField.Text = tostring(DEFAULTS.MaxAngularSpeed)
-	angularDampingField.Text = tostring(DEFAULTS.AngularDamping)
 
 	notify("Anti-Fling", "Settings reset to defaults.")
 end)
 
 local panelOpen = false
-local loaderToken = 0
-
-local function showLoaderThenContent()
-	loaderToken += 1
-
-	local thisToken = loaderToken
-
-	loaderContainer.Visible = true
-	contentContainer.Visible = false
-
-	startSpin()
-
-	task.delay(0.65, function()
-		if thisToken ~= loaderToken then
-			return
-		end
-
-		stopSpin()
-		loaderContainer.Visible = false
-		contentContainer.Visible = true
-	end)
-end
 
 local function openPanel()
 	panel.Visible = true
-	panel.GroupTransparency = 1
-
-	TweenService:Create(panel, TweenInfo.new(0.18), {
-		GroupTransparency = 0,
-	}):Play()
-
-	showLoaderThenContent()
-
 	panelOpen = true
+	TweenService:Create(panel, TweenInfo.new(0.18), { GroupTransparency = 0 }):Play()
 end
 
 local function closePanel()
-	loaderToken += 1
-	stopSpin()
-
-	local tween = TweenService:Create(panel, TweenInfo.new(0.15), {
-		GroupTransparency = 1,
-	})
-
+	panelOpen = false
+	local tween = TweenService:Create(panel, TweenInfo.new(0.15), { GroupTransparency = 1 })
 	tween:Play()
-
 	tween.Completed:Connect(function()
 		if not panelOpen then
 			panel.Visible = false
 		end
 	end)
-
-	panelOpen = false
 end
 
 toggleButton.MouseButton1Click:Connect(function()
@@ -1046,9 +836,7 @@ toggleButton.MouseButton1Click:Connect(function()
 end)
 
 local dragging = false
-local dragInput = nil
-local dragStart = nil
-local startPos = nil
+local dragInput, dragStart, startPos
 
 header.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -1094,9 +882,7 @@ global.__AntiFlingGuiController = {
 		end
 
 		MainConnections = {}
-
 		teardownCharacter()
-		stopSpin()
 
 		if gui and gui.Parent then
 			gui:Destroy()
@@ -1104,6 +890,5 @@ global.__AntiFlingGuiController = {
 	end,
 }
 
-notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready. Latest update; 7:09 PM")
-notify("Warning", "Warning: This script has not been fully Anti-Cheat tested fully to CFE Guidlines. If you trigger the Anti-Cheat a kick as most is what is expected.")
-print("[AntiFling] Loaded with synced Acid-Redirect GUI UPDATE: 6:36 PM")
+notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready. Latest update: 7:09 PM")
+notify("Warning", "This script has not been fully anti-cheat tested to CFE guidelines. Use with caution.", 6)

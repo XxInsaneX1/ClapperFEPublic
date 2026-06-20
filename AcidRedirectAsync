@@ -1715,6 +1715,6 @@ heartbeatConnection = RunService.Heartbeat:Connect(onHeartbeat)
 
 global.__AcidRedirectController = Controller
 
-notifyAcid("AcidRedirect v8 loaded. Acid-only protection active.", 2.5)
+notifyAcid("AcidRedirect v9 loaded. Acid-only protection active.", 2.5)
 
 return Controller

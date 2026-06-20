@@ -73,7 +73,7 @@ local CONFIG = {
 	EnableRagdollSlidePrediction = true,
 
 	RedirectOnlyWhenRagdolled = true,
-	RequireTrajectoryApi = true,
+	RequireTrajectoryApi = false,
 
 	EnableStandingSlide = false,
 	EnableStandingVelocitySlide = false,
@@ -697,11 +697,11 @@ local function predictTrajectoryExternal()
 end
 
 local function predictTrajectory()
-	if CONFIG.RequireTrajectoryApi then
-		return predictTrajectoryExternal()
+	if ExternalPredictPlayerLanding then
+		local result = predictTrajectoryExternal()
+		if result then return result end
 	end
-
-	return predictTrajectoryExternal() or predictTrajectoryInternal()
+	return predictTrajectoryInternal()
 end
 
 local function scanTrajectoryForAcid(prediction)

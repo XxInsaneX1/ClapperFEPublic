@@ -890,5 +890,5 @@ global.__AntiFlingGuiController = {
 	end,
 }
 
-notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready. Latest update: 7:09 PM")
+notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready. Latest update: 7:25 PM")
 notify("Warning", "This script has not been fully anti-cheat tested to CFE guidelines. Use with caution.", 6)

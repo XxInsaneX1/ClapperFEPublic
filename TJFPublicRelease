@@ -1,11 +1,10 @@
 --------------------------------------------------------------------------
--- Trajectory Finder API v2 fixed
+-- Trajectory Finder API rewritten
 -- Returns PredictPlayerLanding(playerObjectOrCharacter, options)
 --------------------------------------------------------------------------
 
 local Workspace = game:GetService("Workspace")
 
-local SHOW_TRAJECTORY_ARC = true
 local ARC_FOLDER_NAME = "__TrajectoryArcVisuals"
 
 local DEFAULT_OPTIONS = {
@@ -29,7 +28,7 @@ local DEFAULT_OPTIONS = {
 	CastSize = nil,
 	CastRadius = nil,
 
-	DrawArc = nil,
+	DrawArc = false,
 	ClearArc = true,
 	ArcVisualStride = 1,
 	ArcThickness = 0.12,
@@ -41,12 +40,12 @@ local DEFAULT_OPTIONS = {
 	RagdollForwardBlend = 0.35,
 }
 
-local ARC_PRIMARY_COLOR = Color3.fromRGB(0, 255, 180)
-local ARC_SECONDARY_COLOR = Color3.fromRGB(255, 190, 60)
-local ARC_HIT_COLOR = Color3.fromRGB(255, 70, 70)
-local ARC_END_MARKER_COLOR = Color3.fromRGB(255, 0, 0)
+local COLOR_PRIMARY = Color3.fromRGB(0, 255, 180)
+local COLOR_SECONDARY = Color3.fromRGB(255, 190, 60)
+local COLOR_HIT = Color3.fromRGB(255, 70, 70)
+local COLOR_END = Color3.fromRGB(255, 0, 0)
 
-local function isPositiveNumber(v)
+local function positive(v)
 	return typeof(v) == "number" and v > 0
 end
 
@@ -63,18 +62,18 @@ local function mergeOptions(options)
 		end
 	end
 
-	if not isPositiveNumber(merged.MaxTime) then
+	if not positive(merged.MaxTime) then
 		merged.MaxTime = DEFAULT_OPTIONS.MaxTime
 	end
 
-	if not isPositiveNumber(merged.TimeStep) then
+	if not positive(merged.TimeStep) then
 		merged.TimeStep = DEFAULT_OPTIONS.TimeStep
 	end
 
 	merged.TimeStep = math.clamp(merged.TimeStep, 1 / 240, 1 / 10)
 
 	if typeof(merged.Gravity) ~= "number" or merged.Gravity < 0 then
-		merged.Gravity = DEFAULT_OPTIONS.Gravity
+		merged.Gravity = Workspace.Gravity
 	end
 
 	if typeof(merged.IgnoreWater) ~= "boolean" then
@@ -84,17 +83,17 @@ local function mergeOptions(options)
 	return merged
 end
 
-local function getCharacter(playerOrCharacter)
-	if typeof(playerOrCharacter) ~= "Instance" then
+local function getCharacter(value)
+	if typeof(value) ~= "Instance" then
 		return nil
 	end
 
-	if playerOrCharacter:IsA("Player") then
-		return playerOrCharacter.Character
+	if value:IsA("Player") then
+		return value.Character
 	end
 
-	if playerOrCharacter:IsA("Model") then
-		return playerOrCharacter
+	if value:IsA("Model") then
+		return value
 	end
 
 	return nil
@@ -126,7 +125,7 @@ local function isCharacterRagdolled(character)
 end
 
 local function getMass(rootPart, character, options)
-	if isPositiveNumber(options.Mass) then
+	if positive(options.Mass) then
 		return options.Mass
 	end
 
@@ -134,20 +133,20 @@ local function getMass(rootPart, character, options)
 		return rootPart.AssemblyMass
 	end
 
-	local totalMass = 0
+	local total = 0
 
 	if character then
 		for _, d in ipairs(character:GetDescendants()) do
 			if d:IsA("BasePart") then
-				totalMass += d:GetMass()
+				total += d:GetMass()
 			end
 		end
 	end
 
-	return totalMass > 0 and totalMass or 70
+	return total > 0 and total or 70
 end
 
-local function buildRaycastParams(character, options)
+local function buildParams(character, options)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = options.IgnoreWater
@@ -173,7 +172,7 @@ end
 local function getCastInfo(rootPart, character, options)
 	local mode = options.CastMode
 	if mode ~= "Block" and mode ~= "Sphere" and mode ~= "Ray" then
-		mode = DEFAULT_OPTIONS.CastMode
+		mode = "Block"
 	end
 
 	local rotation = rootPart.CFrame.Rotation
@@ -183,19 +182,20 @@ local function getCastInfo(rootPart, character, options)
 	if typeof(options.CastSize) == "Vector3" then
 		size = options.CastSize
 	elseif character then
-		local boundsCFrame, boundsSize = character:GetBoundingBox()
-		centerOffset = rootPart.CFrame:PointToObjectSpace(boundsCFrame.Position)
-		size = boundsSize
+		local boxCFrame, boxSize = character:GetBoundingBox()
+		centerOffset = rootPart.CFrame:PointToObjectSpace(boxCFrame.Position)
+		size = boxSize
 	end
 
-	local padding = isPositiveNumber(options.CastPadding) and options.CastPadding or 0
+	local padding = positive(options.CastPadding) and options.CastPadding or 0
+
 	size = Vector3.new(
 		math.max(size.X - padding, 0.1),
 		math.max(size.Y - padding, 0.1),
 		math.max(size.Z - padding, 0.1)
 	)
 
-	local radius = isPositiveNumber(options.CastRadius) and options.CastRadius or math.max(size.X, size.Z) * 0.5
+	local radius = positive(options.CastRadius) and options.CastRadius or math.max(size.X, size.Z) * 0.5
 
 	return {
 		Mode = mode,
@@ -208,14 +208,13 @@ end
 
 local function getDragAcceleration(velocity, mass, options)
 	local speed = velocity.Magnitude
-
 	if speed <= 0.001 then
 		return Vector3.zero
 	end
 
-	local airDensity = typeof(options.AirDensity) == "number" and options.AirDensity or DEFAULT_OPTIONS.AirDensity
-	local dragCoefficient = typeof(options.DragCoefficient) == "number" and options.DragCoefficient or DEFAULT_OPTIONS.DragCoefficient
-	local crossSectionArea = typeof(options.CrossSectionArea) == "number" and options.CrossSectionArea or DEFAULT_OPTIONS.CrossSectionArea
+	local airDensity = typeof(options.AirDensity) == "number" and options.AirDensity or 0
+	local dragCoefficient = typeof(options.DragCoefficient) == "number" and options.DragCoefficient or 0
+	local crossSectionArea = typeof(options.CrossSectionArea) == "number" and options.CrossSectionArea or 0
 
 	if airDensity <= 0 or dragCoefficient <= 0 or crossSectionArea <= 0 then
 		return Vector3.zero
@@ -230,16 +229,16 @@ local function getMagnusAcceleration(velocity, angularVelocity, options)
 		return Vector3.zero
 	end
 
-	local coefficient = typeof(options.MagnusCoefficient) == "number" and options.MagnusCoefficient or DEFAULT_OPTIONS.MagnusCoefficient
+	local coefficient = typeof(options.MagnusCoefficient) == "number" and options.MagnusCoefficient or 0
 	if coefficient <= 0 then
 		return Vector3.zero
 	end
 
 	local magnus = angularVelocity:Cross(velocity) * coefficient
-	local maxAcceleration = isPositiveNumber(options.MaxMagnusAcceleration) and options.MaxMagnusAcceleration or DEFAULT_OPTIONS.MaxMagnusAcceleration
+	local maxAccel = positive(options.MaxMagnusAcceleration) and options.MaxMagnusAcceleration or 80
 
-	if magnus.Magnitude > maxAcceleration then
-		magnus = magnus.Unit * maxAcceleration
+	if magnus.Magnitude > maxAccel then
+		magnus = magnus.Unit * maxAccel
 	end
 
 	return magnus
@@ -269,7 +268,7 @@ local function safeBlockcast(cframe, size, displacement, params)
 	return Workspace:Raycast(cframe.Position, displacement, params)
 end
 
-local function castAlongPath(position, displacement, castInfo, params)
+local function castPath(position, displacement, castInfo, params)
 	if displacement.Magnitude <= 0.001 then
 		return nil
 	end
@@ -282,10 +281,8 @@ local function castAlongPath(position, displacement, castInfo, params)
 		return safeSpherecast(position, castInfo.Radius, displacement, params)
 	end
 
-	local castCenter = position + castInfo.Rotation:VectorToWorldSpace(castInfo.CenterOffset)
-	local castCFrame = CFrame.new(castCenter) * castInfo.Rotation
-
-	return safeBlockcast(castCFrame, castInfo.Size, displacement, params)
+	local center = position + castInfo.Rotation:VectorToWorldSpace(castInfo.CenterOffset)
+	return safeBlockcast(CFrame.new(center) * castInfo.Rotation, castInfo.Size, displacement, params)
 end
 
 local function getArcFolder()
@@ -300,7 +297,7 @@ local function getArcFolder()
 	return folder
 end
 
-local function clearArcFolder()
+local function clearArc()
 	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
 	if folder then
 		folder:ClearAllChildren()
@@ -324,7 +321,7 @@ local function makeArcPart(name, size, color, transparency)
 	return part
 end
 
-local function getCylinderCFrameBetween(a, b)
+local function cylinderBetween(a, b)
 	local midpoint = (a + b) * 0.5
 	local direction = b - a
 
@@ -345,19 +342,19 @@ local function getCylinderCFrameBetween(a, b)
 	return CFrame.fromMatrix(midpoint, right, up, back)
 end
 
-local function drawSolidPath(prediction, color, options, prefix)
+local function drawPath(prediction, color, options, prefix)
 	if not prediction or typeof(prediction.Trajectory) ~= "table" then
 		return
 	end
 
 	local trajectory = prediction.Trajectory
-	if #trajectory <= 0 then
+	if #trajectory <= 1 then
 		return
 	end
 
 	local folder = getArcFolder()
-	local stride = math.max(math.floor(isPositiveNumber(options.ArcVisualStride) and options.ArcVisualStride or 1), 1)
-	local thickness = isPositiveNumber(options.ArcThickness) and options.ArcThickness or 0.12
+	local stride = math.max(math.floor(positive(options.ArcVisualStride) and options.ArcVisualStride or 1), 1)
+	local thickness = positive(options.ArcThickness) and options.ArcThickness or 0.12
 	local transparency = typeof(options.ArcTransparency) == "number" and options.ArcTransparency or 0.08
 
 	for i = 1, #trajectory - 1, stride do
@@ -370,7 +367,7 @@ local function drawSolidPath(prediction, color, options, prefix)
 			if distance > 0.001 then
 				local segment = makeArcPart(prefix .. "_Path", Vector3.new(thickness, distance, thickness), color, transparency)
 				segment.Shape = Enum.PartType.Cylinder
-				segment.CFrame = getCylinderCFrameBetween(a, b)
+				segment.CFrame = cylinderBetween(a, b)
 				segment.Parent = folder
 			end
 		end
@@ -378,31 +375,31 @@ local function drawSolidPath(prediction, color, options, prefix)
 end
 
 local function drawEndMarker(prediction)
-	if not prediction or typeof(prediction.Trajectory) ~= "table" or #prediction.Trajectory <= 0 then
+	if not prediction or typeof(prediction.Trajectory) ~= "table" or #prediction.Trajectory == 0 then
 		return
 	end
 
-	local markerPosition = prediction.LandPosition or prediction.RootPosition or prediction.Trajectory[#prediction.Trajectory]
-	if typeof(markerPosition) ~= "Vector3" then
+	local pos = prediction.LandPosition or prediction.RootPosition or prediction.Trajectory[#prediction.Trajectory]
+	if typeof(pos) ~= "Vector3" then
 		return
 	end
 
-	local marker = makeArcPart("EndMarker", Vector3.new(0.85, 0.85, 0.85), ARC_END_MARKER_COLOR, 0.02)
+	local marker = makeArcPart("EndMarker", Vector3.new(0.85, 0.85, 0.85), COLOR_END, 0.02)
 	marker.Shape = Enum.PartType.Ball
-	marker.CFrame = CFrame.new(markerPosition)
+	marker.CFrame = CFrame.new(pos)
 	marker.Parent = getArcFolder()
 end
 
-local function buildPredictionFromState(character, rootPart, options, initialVelocity, initialAngularVelocity)
+local function buildPrediction(character, rootPart, options, initialVelocity, initialAngularVelocity)
 	local mass = getMass(rootPart, character, options)
 	local position = rootPart.Position
 	local velocity = initialVelocity or rootPart.AssemblyLinearVelocity
 	local angularVelocity = initialAngularVelocity or rootPart.AssemblyAngularVelocity
 	local gravity = Vector3.new(0, -options.Gravity, 0)
-	local params = buildRaycastParams(character, options)
+	local params = buildParams(character, options)
 	local castInfo = getCastInfo(rootPart, character, options)
-	local trajectory = { position }
 
+	local trajectory = { position }
 	local elapsed = 0
 
 	while elapsed < options.MaxTime do
@@ -411,12 +408,12 @@ local function buildPredictionFromState(character, rootPart, options, initialVel
 		local nextVelocity = velocity + acceleration * step
 		local nextPosition = position + velocity * step + 0.5 * acceleration * step * step
 		local displacement = nextPosition - position
-		local hitResult = castAlongPath(position, displacement, castInfo, params)
+
+		local hitResult = castPath(position, displacement, castInfo, params)
 
 		if hitResult then
 			local alpha = math.clamp(hitResult.Distance / math.max(displacement.Magnitude, 0.001), 0, 1)
 			local hitRootPosition = position:Lerp(nextPosition, alpha)
-			local hitTime = elapsed + step * alpha
 
 			table.insert(trajectory, hitRootPosition)
 
@@ -427,7 +424,7 @@ local function buildPredictionFromState(character, rootPart, options, initialVel
 				LandPosition = hitResult.Position,
 				RootPosition = hitRootPosition,
 				LandNormal = hitResult.Normal,
-				Time = hitTime,
+				Time = elapsed + step * alpha,
 				Velocity = velocity:Lerp(nextVelocity, alpha),
 				CastMode = castInfo.Mode,
 				CastSize = castInfo.Size,
@@ -447,8 +444,8 @@ local function buildPredictionFromState(character, rootPart, options, initialVel
 		Trajectory = trajectory,
 		HitResult = nil,
 		HitPart = nil,
-		LandPosition = trajectory[#trajectory],
-		RootPosition = trajectory[#trajectory],
+		LandPosition = position,
+		RootPosition = position,
 		Time = options.MaxTime,
 		Velocity = velocity,
 		CastMode = castInfo.Mode,
@@ -458,19 +455,19 @@ local function buildPredictionFromState(character, rootPart, options, initialVel
 	}
 end
 
-local function getHorizontal(v)
+local function horizontal(v)
 	return Vector3.new(v.X, 0, v.Z)
 end
 
 local function getRagdollAlternateVelocity(rootPart, options)
 	local velocity = rootPart.AssemblyLinearVelocity
-	local horizontal = getHorizontal(velocity)
-	local look = getHorizontal(rootPart.CFrame.LookVector)
+	local h = horizontal(velocity)
+	local look = horizontal(rootPart.CFrame.LookVector)
 
 	local baseDirection
 
-	if horizontal.Magnitude > 0.001 then
-		baseDirection = horizontal.Unit
+	if h.Magnitude > 0.001 then
+		baseDirection = h.Unit
 	elseif look.Magnitude > 0.001 then
 		baseDirection = look.Unit
 	else
@@ -483,58 +480,37 @@ local function getRagdollAlternateVelocity(rootPart, options)
 		side = -side
 	end
 
-	local sideVelocity = isPositiveNumber(options.RagdollSideVelocity) and options.RagdollSideVelocity or 18
-	local forwardBlend = typeof(options.RagdollForwardBlend) == "number" and options.RagdollForwardBlend or 0.35
-	forwardBlend = math.clamp(forwardBlend, 0, 1)
+	local sideVelocity = positive(options.RagdollSideVelocity) and options.RagdollSideVelocity or 18
+	local forwardBlend = typeof(options.RagdollForwardBlend) == "number" and math.clamp(options.RagdollForwardBlend, 0, 1) or 0.35
 
-	local alternateHorizontal = horizontal * forwardBlend + side * sideVelocity
+	local alternateHorizontal = h * forwardBlend + side * sideVelocity
 	return Vector3.new(alternateHorizontal.X, velocity.Y, alternateHorizontal.Z)
 end
 
-local function shouldDrawArc(options)
-	if options.DrawArc == false then
-		return false
-	end
-
-	if options.DrawArc == true then
-		return true
-	end
-
-	return SHOW_TRAJECTORY_ARC
-end
-
-local function drawPredictionVisuals(character, rootPart, options, prediction)
-	if not shouldDrawArc(options) then
+local function drawPrediction(character, rootPart, options, prediction)
+	if options.DrawArc ~= true then
 		return
 	end
 
 	if options.ClearArc ~= false then
-		clearArcFolder()
+		clearArc()
 	end
 
-	drawSolidPath(prediction, prediction.HitPart and ARC_HIT_COLOR or ARC_PRIMARY_COLOR, options, "Primary")
+	drawPath(prediction, prediction.HitPart and COLOR_HIT or COLOR_PRIMARY, options, "Primary")
 	drawEndMarker(prediction)
 
-	if not isCharacterRagdolled(character) then
-		return
-	end
-
-	if options.RagdollExtraPath == false then
-		return
-	end
-
-	local maxPaths = math.clamp(math.floor(isPositiveNumber(options.RagdollMaxVisualPaths) and options.RagdollMaxVisualPaths or 2), 1, 2)
-	if maxPaths < 2 then
+	if not isCharacterRagdolled(character) or options.RagdollExtraPath == false then
 		return
 	end
 
 	local alternateVelocity = getRagdollAlternateVelocity(rootPart, options)
+
 	if (alternateVelocity - rootPart.AssemblyLinearVelocity).Magnitude <= 0.5 then
 		return
 	end
 
-	local alternatePrediction = buildPredictionFromState(character, rootPart, options, alternateVelocity, rootPart.AssemblyAngularVelocity)
-	drawSolidPath(alternatePrediction, alternatePrediction.HitPart and ARC_HIT_COLOR or ARC_SECONDARY_COLOR, options, "RagdollAlt")
+	local alternatePrediction = buildPrediction(character, rootPart, options, alternateVelocity, rootPart.AssemblyAngularVelocity)
+	drawPath(alternatePrediction, alternatePrediction.HitPart and COLOR_HIT or COLOR_SECONDARY, options, "RagdollAlt")
 end
 
 local function returnPrediction(prediction)
@@ -557,7 +533,7 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 		})
 	end
 
-	local prediction = buildPredictionFromState(
+	local prediction = buildPrediction(
 		character,
 		rootPart,
 		options,
@@ -568,7 +544,7 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 	prediction.DrawArc = options.DrawArc
 	prediction.Ragdolled = isCharacterRagdolled(character)
 
-	drawPredictionVisuals(character, rootPart, options, prediction)
+	drawPrediction(character, rootPart, options, prediction)
 
 	return returnPrediction(prediction)
 end

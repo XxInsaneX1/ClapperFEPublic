@@ -648,20 +648,18 @@ local function startAcidRedirect()
 				notify(titleText, bodyText, duration)
 			end,
 
-			Config = {
-				ShowTrajectoryArc                     = false,
-				ClearArcWhenIdle                      = true,
-
-				EnableKeywordHazardDetection          = true,
-				EnableBroadHazardScan                 = true,
-				EnableWorkspaceHazardCache            = true,
-
-				EnableSlidePrediction                 = true,
-				EnableRagdollSlidePrediction          = true,
-
-				EnableStandingSlidePrediction         = true,
-				EnableStandingVelocitySlidePrediction = true,
-			},
+			Config = {  
+    RedirectOnlyWhenRagdolled                 = false,  -- ADD THIS  
+    ShowTrajectoryArc                         = false,  
+    ClearArcWhenIdle                          = true,  
+    EnableKeywordHazardDetection              = true,  
+    EnableBroadHazardScan                     = true,  
+    EnableWorkspaceHazardCache                = true,  
+    EnableSlidePrediction                     = true,  
+    EnableRagdollSlidePrediction              = true,  
+    EnableStandingSlidePrediction             = true,  
+    EnableStandingVelocitySlidePrediction     = true,  
+},  
 		})
 
 		if loadToken ~= AcidRedirect.LoadToken or not AcidRedirect.Enabled then return end

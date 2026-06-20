@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------
--- AcidPit / Hazard Trajectory Redirect v5 (fixed)
+-- AcidPit / Hazard Trajectory Redirect v5 (fixed + committed redirect)
 -- Expanded hazard detection + notifications + toggleable slide prediction
 --------------------------------------------------------------------------
 
@@ -112,13 +112,14 @@ local CONFIG = {
 	ImpulseMultiplier = 1.15,
 
 	-- Redirect fires only when ragdolled OR horizontal speed exceeds
-	-- WalkSpeed * RedirectMinSpeedMultiplier.
+	-- WalkSpeed * RedirectMinSpeedMultiplier + RedirectSpeedBuffer.
 	RedirectMinSpeedMultiplier = 1.0,
+	RedirectSpeedBuffer        = 2,
 
-	-- FIX: flat studs/s buffer added on top of the WalkSpeed threshold so
-	-- Roblox physics jitter (e.g. 16.003 at WalkSpeed 16) cannot accidentally
-	-- cross the threshold during normal locomotion and trigger a redirect.
-	RedirectSpeedBuffer = 2,
+	-- Once a redirect is committed (fired at least once), we stay in redirect
+	-- mode until the player has verifiably landed on safe ground.
+	-- RedirectMaxDuration is a hard cap to prevent infinite loops.
+	RedirectMaxDuration = 5.0,
 }
 
 if typeof(loaderOptions.ShowTrajectoryArc) == "boolean" then
@@ -191,6 +192,14 @@ local nearestCheckAccumulated = 0
 local lastDangerUntil         = 0
 local overlapSupported        = true
 
+-- Committed redirect tracking:
+-- Once applyRedirect fires for the first time, redirectCommitted = true.
+-- We stay committed (and keep applying the redirect) until we have verified
+-- that the player has landed on non-dangerous ground, or the hard timeout elapses.
+local redirectCommitted  = false
+local redirectStartedAt  = 0
+local redirectCycleCount = 0
+
 raycastParams.FilterType  = Enum.RaycastFilterType.Exclude
 raycastParams.IgnoreWater = true
 
@@ -206,6 +215,12 @@ local function clearArray(array)
 	for index = #array, 1, -1 do
 		array[index] = nil
 	end
+end
+
+local function clearRedirectState()
+	redirectCommitted  = false
+	redirectStartedAt  = 0
+	redirectCycleCount = 0
 end
 
 local function getArcFolder()
@@ -479,6 +494,8 @@ local function setupCharacter(nextCharacter)
 	humanoid  = nextCharacter and nextCharacter:FindFirstChildOfClass("Humanoid") or nil
 	rootPart  = getRootPart(nextCharacter)
 	updateRaycastParams()
+	-- Reset redirect commitment on respawn so a new character starts clean.
+	clearRedirectState()
 end
 
 local function pointInsidePartBounds(point, part, padding)
@@ -552,12 +569,8 @@ local function getNearestAcidDistance(position)
 		end
 	end
 
-	-- FIX: was returning 0 when acidParts is empty (fallback folder case).
-	-- Returning 0 made nearestAcidDistance always <= ActivationDistance,
-	-- causing the script to think the player was always at the acid pit and
-	-- run prediction + redirect logic everywhere in the map.
-	-- Now returns math.huge when no parts are found, which correctly causes
-	-- shouldPredict() to early-return false until real acid parts load in.
+	-- Returns math.huge when no acid parts exist so shouldPredict() correctly
+	-- short-circuits away from the pit.
 	return nearest
 end
 
@@ -1092,22 +1105,37 @@ local function getSafeVelocity(danger)
 	return desiredDirection * horizontalSpeed + Vector3.new(0, targetY, 0)
 end
 
--- Redirect only fires when:
---   (a) the player is ragdolled, OR
---   (b) horizontal speed exceeds WalkSpeed * RedirectMinSpeedMultiplier
---       plus a flat buffer (RedirectSpeedBuffer studs/s) that absorbs
---       Roblox physics jitter so normal walking never crosses the threshold.
+-- Returns true when it is appropriate to override the player's velocity.
 --
--- Example with defaults (WalkSpeed 16, multiplier 1.0, buffer 2):
---   threshold = 16 * 1.0 + 2 = 18 studs/s
---   Normal walking peaks at ~16 → never fires.
---   A fling typically sends the player to 60-200 studs/s → always fires.
+-- Gate logic:
+--   1. Always redirect when ragdolled.
+--   2. Once we have committed to a redirect (redirectCommitted = true), keep
+--      going until the player reaches safe ground — bypassing the speed check
+--      because the player may have slowed down mid-arc while still being over
+--      the acid. The hard timeout (RedirectMaxDuration) is the only exit here.
+--   3. For non-ragdoll, non-committed cases: only redirect if horizontal speed
+--      exceeds WalkSpeed * multiplier + buffer (prevents triggering during
+--      normal walking).
 local function canApplyRedirect()
 	if not humanoid or not rootPart or not rootPart.Parent then
 		return false
 	end
 
+	-- Hard timeout: if we've been redirecting for longer than RedirectMaxDuration,
+	-- something went badly wrong. Clear commitment and stop.
+	if redirectCommitted
+		and os.clock() - redirectStartedAt > CONFIG.RedirectMaxDuration then
+		clearRedirectState()
+		return false
+	end
+
 	if isRagdolled() then
+		return true
+	end
+
+	-- Once committed, skip the speed threshold — the flung player may have
+	-- decelerated via air drag but still needs guidance to safe ground.
+	if redirectCommitted then
 		return true
 	end
 
@@ -1121,7 +1149,16 @@ end
 local function applyRedirect(deltaTime)
 	if not rootPart or not rootPart.Parent or not Controller.LastDanger then return end
 
-	notifyHazardThrottled("attempting_redirect", "Attempting redirect to safety", 2.5)
+	-- Mark commitment on the first application so subsequent frames keep
+	-- redirecting even after speed drops below the normal threshold.
+	if not redirectCommitted then
+		redirectCommitted = true
+		redirectStartedAt = os.clock()
+		redirectCycleCount = 0
+		notifyHazardThrottled("redirect_committed", "Redirecting to safety...", 2.5)
+	end
+
+	redirectCycleCount += 1
 
 	local danger          = Controller.LastDanger
 	local currentVelocity = rootPart.AssemblyLinearVelocity
@@ -1158,12 +1195,23 @@ local function applyRedirect(deltaTime)
 	end
 end
 
+-- Checks whether the player is currently standing on / directly above a
+-- dangerous surface. Used as a final confirmation step before clearing the
+-- committed redirect state — a clean trajectory prediction is necessary but
+-- not sufficient; the player also must not be physically over the acid.
+local function isCurrentlyOverAcid()
+	if not rootPart or not rootPart.Parent then return false end
+
+	local groundHit = getGroundHit(rootPart.Position)
+
+	if not groundHit then return false end
+
+	return isDangerousInstance(groundHit.Instance)
+end
+
 local function shouldPredict()
 	if not rootPart or not rootPart.Parent then return false end
 
-	-- nearestAcidDistance is now math.huge when no acid parts exist (fallback
-	-- folder is empty), so this correctly short-circuits the whole function
-	-- instead of falling through as if the player is at the pit.
 	if nearestAcidDistance > CONFIG.ActivationDistance then return false end
 
 	local velocity           = rootPart.AssemblyLinearVelocity
@@ -1179,6 +1227,9 @@ local function shouldPredict()
 	end
 
 	if isRagdolled() then return true end
+
+	-- Also keep predicting while committed so we can confirm safe landing.
+	if redirectCommitted then return true end
 
 	return getDangerNearPoint(rootPart.Position, CONFIG.SlideDangerRadius) ~= nil
 end
@@ -1201,6 +1252,7 @@ local function onHeartbeat(deltaTime)
 	if not Controller.Enabled then
 		Controller.LastDanger     = nil
 		Controller.LastPrediction = nil
+		clearRedirectState()
 
 		if CONFIG.ClearArcWhenIdle then
 			clearTrajectoryArc()
@@ -1246,10 +1298,49 @@ local function onHeartbeat(deltaTime)
 				else
 					lastDangerUntil = os.clock() + CONFIG.ApplyWindow
 				end
+
 			elseif os.clock() > lastDangerUntil then
-				Controller.LastDanger = nil
+				-- Trajectory prediction shows no danger and the apply window has
+				-- expired. If we were committed to a redirect, we must also verify
+				-- the player is not currently positioned over acid before clearing.
+				-- Scenario: redirect fires → new velocity points to safety →
+				-- prediction looks clean → but player is still mid-arc over the
+				-- acid and gravity will pull them down into it if we stop now.
+				if redirectCommitted and isCurrentlyOverAcid() then
+					-- Player is still above dangerous ground. Synthesize a danger
+					-- from their current position so the redirect keeps firing.
+					local groundHit = getGroundHit(rootPart.Position)
+
+					Controller.LastDanger = {
+						Kind       = "DirectHit",
+						Part       = groundHit and groundHit.Instance or nil,
+						Position   = rootPart.Position,
+						Prediction = prediction,
+					}
+
+					lastDangerUntil = os.clock() + CONFIG.ApplyWindow
+
+					notifyHazardThrottled(
+						"still_over_acid",
+						"Still over acid — continuing redirect",
+						2.0
+					)
+				else
+					-- Genuinely safe: trajectory is clean AND player is not over acid.
+					clearRedirectState()
+					Controller.LastDanger     = nil
+					Controller.LastPrediction = nil
+
+					if CONFIG.ClearArcWhenIdle then
+						clearTrajectoryArc()
+					end
+				end
 			end
+
 		elseif os.clock() > lastDangerUntil then
+			-- shouldPredict() returned false (player far from acid).
+			-- If redirectCommitted, far-from-acid means we made it — clear.
+			clearRedirectState()
 			Controller.LastDanger     = nil
 			Controller.LastPrediction = nil
 
@@ -1277,6 +1368,7 @@ function Controller.Stop()
 	Controller.LastDanger     = nil
 	Controller.LastPrediction = nil
 	lastDangerUntil           = 0
+	clearRedirectState()
 
 	if CONFIG.ClearArcWhenIdle then
 		clearTrajectoryArc()

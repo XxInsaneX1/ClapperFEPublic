@@ -1216,32 +1216,37 @@ local function runPredictionCycle()
 		return
 	end
 
-	local ragdoll = isRagdolled()
+local function isRagdolled()
+	if not humanoid then return false end
 
-	if CONFIG.RedirectOnlyWhenRagdolled and not ragdoll then
-		if not isRedirecting() then
-			Controller.LastDanger = nil
-			Controller.LastAcidPart = nil
-		end
+	local state = humanoid:GetState()
 
-		if CONFIG.ClearArcWhenIdle then
-			clearTrajectoryArc()
-		end
-
-		return
+	if state == Enum.HumanoidStateType.Physics
+		or state == Enum.HumanoidStateType.Ragdoll
+		or state == Enum.HumanoidStateType.FallingDown
+		or state == Enum.HumanoidStateType.PlatformStanding then
+		return true
 	end
 
-	local prediction = predictTrajectory()
-	Controller.LastPrediction = prediction
-
-	if not prediction then
-		if not isRedirecting() then
-			Controller.LastDanger = nil
-			Controller.LastAcidPart = nil
-		end
-
-		return
+	if humanoid.PlatformStand then
+		return true
 	end
+
+	if character then
+		local rv = character:FindFirstChild("Ragdolled")
+			or character:FindFirstChild("IsRagdolled")
+			or character:FindFirstChild("RagdollEnabled")
+		if rv and rv:IsA("BoolValue") and rv.Value then
+			return true
+		end
+		if character:GetAttribute("Ragdolled") == true
+			or character:GetAttribute("IsRagdolled") == true then
+			return true
+		end
+	end
+
+	return false
+end
 
 	local danger = getPredictionAcidDanger(prediction, ragdoll)
 

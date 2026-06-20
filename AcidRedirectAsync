@@ -1,23 +1,27 @@
---------------------------------------------------------------------------
--- AcidPit / Hazard Trajectory Redirect rewritten
--- Luau Roblox client executor
--- Ragdoll-only hazard redirect
---------------------------------------------------------------------------
+-- AcidPit / Hazard Trajectory Redirect v5
+-- Expanded hazard detection + notifications + toggleable slide prediction
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
-local global = getgenv and getgenv() or _G
+local global = if getgenv then getgenv() else _G
 
 local loaderOptions = ...
 if typeof(loaderOptions) ~= "table" then
 	loaderOptions = {}
 end
 
-local NotifyCallback = typeof(loaderOptions.Notify) == "function" and loaderOptions.Notify or nil
-local ExternalPredictPlayerLanding = typeof(loaderOptions.PredictPlayerLanding) == "function" and loaderOptions.PredictPlayerLanding or nil
+local NotifyCallback = nil
+if typeof(loaderOptions.Notify) == "function" then
+	NotifyCallback = loaderOptions.Notify
+end
+
+local ExternalPredictPlayerLanding = nil
+if typeof(loaderOptions.PredictPlayerLanding) == "function" then
+	ExternalPredictPlayerLanding = loaderOptions.PredictPlayerLanding
+end
 
 if global.__AcidRedirectController and typeof(global.__AcidRedirectController.Destroy) == "function" then
 	pcall(global.__AcidRedirectController.Destroy)
@@ -25,7 +29,6 @@ end
 
 local CONFIG = {
 	Enabled = true,
-	RagdollOnly = true,
 
 	EnableNotifications = true,
 	NotificationCooldown = 1.75,
@@ -34,7 +37,6 @@ local CONFIG = {
 	EnableBroadHazardScan = true,
 	BroadHazardScanRadius = 8,
 	DangerDescendantScanLimit = 120,
-	DangerCacheLifetime = 2,
 
 	DangerKeywords = {
 		"acid",
@@ -56,9 +58,7 @@ local CONFIG = {
 	},
 
 	ShowTrajectoryArc = true,
-	DrawSafeTrajectoryArc = true,
 	ClearArcWhenIdle = true,
-
 	ArcFolderName = "__AcidRedirectTrajectoryArc",
 	ArcVisualStride = 1,
 	ArcThickness = 0.12,
@@ -73,7 +73,6 @@ local CONFIG = {
 	ApplyWindow = 0.38,
 	MinSpeedToPredict = 8,
 	ActivationDistance = 230,
-	AlwaysPredictWhileRagdolled = true,
 
 	PredictionMaxTime = 1.85,
 	PredictionTimeStep = 1 / 40,
@@ -88,9 +87,9 @@ local CONFIG = {
 	MaxMagnusAcceleration = 45,
 
 	EnableSlidePrediction = true,
-	EnableStandingSlidePrediction = false,
+	EnableStandingSlidePrediction = true,
 	EnableRagdollSlidePrediction = true,
-	EnableStandingVelocitySlidePrediction = false,
+	EnableStandingVelocitySlidePrediction = true,
 
 	SlideLookahead = 1.5,
 	SlideTimeStep = 1 / 12,
@@ -99,10 +98,13 @@ local CONFIG = {
 	SlideProbeHeight = 4,
 	SlideSurfaceOffset = 0.2,
 	MinSlideSpeed = 3.5,
+	MinStandingSlideSpeed = 4.5,
+	StandingSlideVelocityMultiplier = 1,
 	MaxSlideSpeed = 78,
 	DefaultSurfaceFriction = 0.45,
 	StaticFrictionMultiplier = 1.15,
 	RagdollFrictionMultiplier = 0.55,
+	StandingFrictionMultiplier = 1.2,
 
 	RedirectResponsiveness = 16,
 	RedirectHorizontalSpeed = 48,
@@ -125,15 +127,50 @@ if typeof(loaderOptions.ShowTrajectoryArc) == "boolean" then
 end
 
 if typeof(loaderOptions.Config) == "table" then
-	for k, v in pairs(loaderOptions.Config) do
-		CONFIG[k] = v
+	for key, value in pairs(loaderOptions.Config) do
+		CONFIG[key] = value
 	end
 end
 
-CONFIG.RagdollOnly = true
-CONFIG.EnableStandingSlidePrediction = false
-CONFIG.EnableStandingVelocitySlidePrediction = false
-CONFIG.EnableRagdollSlidePrediction = true
+local notifyTimes = {}
+
+local function notifyHazard(message, duration)
+	if not NotifyCallback then
+		return
+	end
+
+	pcall(function()
+		NotifyCallback("Acid-Redirect", message, duration or 2.5)
+	end)
+end
+
+local function notifyHazardThrottled(key, message, duration)
+	if CONFIG.EnableNotifications == false then
+		return
+	end
+
+	local now = os.clock()
+	local last = notifyTimes[key]
+
+	if last and now - last < CONFIG.NotificationCooldown then
+		return
+	end
+
+	notifyTimes[key] = now
+	notifyHazard(message, duration)
+end
+
+local map = Workspace:WaitForChild("Map", 10)
+assert(map, "Map folder not found")
+
+local acidAbnormality = map:FindFirstChild("AcidAbnormality")
+local acidPitFolder = acidAbnormality and acidAbnormality:FindFirstChild("AcidPit") or nil
+
+if not acidPitFolder then
+	acidPitFolder = Instance.new("Folder")
+	acidPitFolder.Name = "__MissingAcidPitFallback"
+	acidPitFolder.Parent = Workspace
+end
 
 local Controller = {
 	Enabled = CONFIG.Enabled,
@@ -149,147 +186,36 @@ local humanoid
 local rootPart
 
 local raycastParams = RaycastParams.new()
-raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-raycastParams.IgnoreWater = true
-
 local acidOverlapParams = OverlapParams.new()
-acidOverlapParams.FilterType = Enum.RaycastFilterType.Include
-pcall(function()
-	acidOverlapParams.RespectCanCollide = false
-end)
-
 local broadHazardOverlapParams = OverlapParams.new()
-broadHazardOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
-broadHazardOverlapParams.FilterDescendantsInstances = {}
-pcall(function()
-	broadHazardOverlapParams.RespectCanCollide = false
-end)
 
-local acidPitFolder
 local acidParts = {}
 local acidPartSet = {}
 local connections = {}
-local acidFolderConnections = {}
-local heartbeatConnection
+local heartbeatConnection = nil
 
 local accumulated = 0
 local nearestAcidDistance = math.huge
 local nearestCheckAccumulated = 0
-local acidResolveAccumulated = 0
 local lastDangerUntil = 0
 local overlapSupported = true
 
-local notifyTimes = {}
-local dangerCache = {}
-local dangerCacheTimes = {}
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+raycastParams.IgnoreWater = true
+
+acidOverlapParams.FilterType = Enum.RaycastFilterType.Include
+acidOverlapParams.FilterDescendantsInstances = { acidPitFolder }
+acidOverlapParams.RespectCanCollide = false
+
+broadHazardOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
+broadHazardOverlapParams.FilterDescendantsInstances = {}
+broadHazardOverlapParams.RespectCanCollide = false
 
 local function clearArray(array)
-	for i = #array, 1, -1 do
-		array[i] = nil
+	for index = #array, 1, -1 do
+		array[index] = nil
 	end
 end
-
-local function disconnectAll(array)
-	for _, c in ipairs(array) do
-		pcall(function()
-			c:Disconnect()
-		end)
-	end
-	clearArray(array)
-end
-
-local function notify(message, duration)
-	if not NotifyCallback then
-		return
-	end
-
-	pcall(function()
-		NotifyCallback("Acid-Redirect", message, duration or 2.5)
-	end)
-end
-
-local function notifyThrottled(key, message, duration)
-	if CONFIG.EnableNotifications == false then
-		return
-	end
-
-	local now = os.clock()
-	local last = notifyTimes[key]
-
-	if last and now - last < CONFIG.NotificationCooldown then
-		return
-	end
-
-	notifyTimes[key] = now
-	notify(message, duration)
-end
-
-local function getRootPart(model)
-	if not model then
-		return nil
-	end
-
-	return model:FindFirstChild("HumanoidRootPart")
-		or model:FindFirstChild("Torso")
-		or model:FindFirstChild("UpperTorso")
-end
-
-local function updateRaycastParams()
-	local exclude = character and { character } or {}
-
-	raycastParams.FilterDescendantsInstances = exclude
-	broadHazardOverlapParams.FilterDescendantsInstances = exclude
-end
-
-local function setupCharacter(nextCharacter)
-	character = nextCharacter
-
-	if not nextCharacter then
-		humanoid = nil
-		rootPart = nil
-		updateRaycastParams()
-		return
-	end
-
-	humanoid = nextCharacter:FindFirstChildOfClass("Humanoid")
-	rootPart = getRootPart(nextCharacter)
-
-	if not humanoid then
-		task.spawn(function()
-			local found = nextCharacter:WaitForChild("Humanoid", 8)
-			if character == nextCharacter and found then
-				humanoid = found
-			end
-		end)
-	end
-
-	if not rootPart then
-		task.spawn(function()
-			local found = nextCharacter:WaitForChild("HumanoidRootPart", 8)
-			if character == nextCharacter and found then
-				rootPart = found
-			end
-		end)
-	end
-
-	updateRaycastParams()
-end
-
-local function isRagdolled()
-	if not humanoid or not humanoid.Parent then
-		return false
-	end
-
-	local state = humanoid:GetState()
-
-	return state == Enum.HumanoidStateType.Physics
-		or state == Enum.HumanoidStateType.Ragdoll
-		or state == Enum.HumanoidStateType.FallingDown
-end
-
---------------------------------------------------------------------------
--- Arc drawing
---------------------------------------------------------------------------
 
 local function getArcFolder()
 	local folder = Workspace:FindFirstChild(CONFIG.ArcFolderName)
@@ -305,8 +231,13 @@ end
 
 local function clearTrajectoryArc()
 	local folder = Workspace:FindFirstChild(CONFIG.ArcFolderName)
-	if folder then
-		folder:ClearAllChildren()
+
+	if not folder then
+		return
+	end
+
+	for _, child in ipairs(folder:GetChildren()) do
+		child:Destroy()
 	end
 end
 
@@ -327,7 +258,7 @@ local function makeArcPart(name, size, color, transparency)
 	return part
 end
 
-local function cylinderBetween(a, b)
+local function getCylinderCFrameBetween(a, b)
 	local midpoint = (a + b) * 0.5
 	local direction = b - a
 
@@ -353,13 +284,6 @@ local function drawTrajectoryArc(prediction, danger)
 		return
 	end
 
-	if not danger and CONFIG.DrawSafeTrajectoryArc == false then
-		if CONFIG.ClearArcWhenIdle then
-			clearTrajectoryArc()
-		end
-		return
-	end
-
 	clearTrajectoryArc()
 
 	if not prediction or typeof(prediction.Trajectory) ~= "table" or #prediction.Trajectory <= 0 then
@@ -368,116 +292,67 @@ local function drawTrajectoryArc(prediction, danger)
 
 	local trajectory = prediction.Trajectory
 	local folder = getArcFolder()
-	local color = danger and CONFIG.ArcDangerColor or CONFIG.ArcSafeColor
-	local stride = math.max(math.floor(CONFIG.ArcVisualStride or 1), 1)
-	local thickness = CONFIG.ArcThickness or 0.12
-	local transparency = CONFIG.ArcTransparency or 0.08
+	local lineColor = danger and CONFIG.ArcDangerColor or CONFIG.ArcSafeColor
+	local stride = math.max(CONFIG.ArcVisualStride, 1)
 
-	for i = 1, #trajectory - 1, stride do
-		local a = trajectory[i]
-		local b = trajectory[math.min(i + stride, #trajectory)]
+	for index = 1, #trajectory - 1, stride do
+		local a = trajectory[index]
+		local b = trajectory[math.min(index + stride, #trajectory)]
 
 		if typeof(a) == "Vector3" and typeof(b) == "Vector3" then
 			local distance = (b - a).Magnitude
 
 			if distance > 0.001 then
-				local part = makeArcPart("PathLine", Vector3.new(thickness, distance, thickness), color, transparency)
-				part.Shape = Enum.PartType.Cylinder
-				part.CFrame = cylinderBetween(a, b)
-				part.Parent = folder
+				local segment = makeArcPart(
+					"PathLine",
+					Vector3.new(CONFIG.ArcThickness, distance, CONFIG.ArcThickness),
+					lineColor,
+					CONFIG.ArcTransparency
+				)
+
+				segment.Shape = Enum.PartType.Cylinder
+				segment.CFrame = getCylinderCFrameBetween(a, b)
+				segment.Parent = folder
 			end
 		end
 	end
 
-	local markerPos = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
+	local markerPosition = prediction.LandPosition or prediction.RootPosition or trajectory[#trajectory]
 
 	if danger and typeof(danger.Position) == "Vector3" then
-		markerPos = danger.Position
+		markerPosition = danger.Position
 	end
 
-	if typeof(markerPos) == "Vector3" then
+	if typeof(markerPosition) == "Vector3" then
 		local marker = makeArcPart(
 			"EndMarker",
 			Vector3.new(CONFIG.ArcLandingMarkerSize, CONFIG.ArcLandingMarkerSize, CONFIG.ArcLandingMarkerSize),
-			danger and CONFIG.ArcDangerColor or CONFIG.ArcEndMarkerColor,
+			CONFIG.ArcEndMarkerColor,
 			0.02
 		)
 
 		marker.Shape = Enum.PartType.Ball
-		marker.CFrame = CFrame.new(markerPos)
+		marker.CFrame = CFrame.new(markerPosition)
 		marker.Parent = folder
 	end
 end
 
---------------------------------------------------------------------------
--- Acid folder resolving and danger detection
---------------------------------------------------------------------------
-
 local function rebuildAcidParts()
-	table.clear(acidParts)
-	table.clear(acidPartSet)
+	clearArray(acidParts)
+
+	for part in pairs(acidPartSet) do
+		acidPartSet[part] = nil
+	end
 
 	if not acidPitFolder then
 		return
 	end
 
-	for _, inst in ipairs(acidPitFolder:GetDescendants()) do
-		if inst:IsA("BasePart") then
-			table.insert(acidParts, inst)
-			acidPartSet[inst] = true
+	for _, instance in ipairs(acidPitFolder:GetDescendants()) do
+		if instance:IsA("BasePart") then
+			table.insert(acidParts, instance)
+			acidPartSet[instance] = true
 		end
-	end
-end
-
-local function bindAcidFolder(folder)
-	disconnectAll(acidFolderConnections)
-
-	if not folder then
-		return
-	end
-
-	table.insert(acidFolderConnections, folder.DescendantAdded:Connect(function(inst)
-		if inst:IsA("BasePart") then
-			rebuildAcidParts()
-		end
-	end))
-
-	table.insert(acidFolderConnections, folder.DescendantRemoving:Connect(function(inst)
-		if inst:IsA("BasePart") then
-			task.defer(rebuildAcidParts)
-		end
-	end))
-end
-
-local function resolveAcidPitFolder(forceNotify)
-	local map = Workspace:FindFirstChild("Map")
-	local abnormality = map and map:FindFirstChild("AcidAbnormality")
-	local found = abnormality and abnormality:FindFirstChild("AcidPit")
-
-	if found and found ~= acidPitFolder then
-		acidPitFolder = found
-		acidOverlapParams.FilterDescendantsInstances = { acidPitFolder }
-		bindAcidFolder(acidPitFolder)
-		rebuildAcidParts()
-
-		if forceNotify then
-			notify("Real AcidPit folder synced.", 2.5)
-		end
-	end
-
-	if not acidPitFolder then
-		local fallback = Workspace:FindFirstChild("__MissingAcidPitFallback")
-
-		if not fallback then
-			fallback = Instance.new("Folder")
-			fallback.Name = "__MissingAcidPitFallback"
-			fallback.Parent = Workspace
-		end
-
-		acidPitFolder = fallback
-		acidOverlapParams.FilterDescendantsInstances = { acidPitFolder }
-		bindAcidFolder(acidPitFolder)
-		rebuildAcidParts()
 	end
 end
 
@@ -528,12 +403,33 @@ local function descendantsMentionDanger(instance)
 
 	for _, descendant in ipairs(instance:GetDescendants()) do
 		scanned += 1
+
 		if scanned > CONFIG.DangerDescendantScanLimit then
 			break
 		end
 
 		if textHasDangerKeyword(descendant.Name) or attributesMentionDanger(descendant) then
 			return true
+		end
+
+		if descendant:IsA("ParticleEmitter")
+			or descendant:IsA("Beam")
+			or descendant:IsA("Trail")
+			or descendant:IsA("Fire")
+			or descendant:IsA("Smoke")
+			or descendant:IsA("Sparkles")
+			or descendant:IsA("PointLight")
+			or descendant:IsA("SurfaceLight")
+			or descendant:IsA("SpotLight") then
+
+			if textHasDangerKeyword(descendant.Name) then
+				return true
+			end
+
+			local parent = descendant.Parent
+			if parent and textHasDangerKeyword(parent.Name) then
+				return true
+			end
 		end
 	end
 
@@ -557,7 +453,7 @@ local function ancestryMentionsDanger(instance)
 	return false
 end
 
-local function isDangerousInstanceRaw(instance)
+local function isDangerousInstance(instance)
 	if not instance then
 		return false
 	end
@@ -566,40 +462,64 @@ local function isDangerousInstanceRaw(instance)
 		return true
 	end
 
-	if CONFIG.EnableKeywordHazardDetection == false then
+	if not CONFIG.EnableKeywordHazardDetection then
 		return false
 	end
 
-	return ancestryMentionsDanger(instance) or descendantsMentionDanger(instance)
+	if ancestryMentionsDanger(instance) then
+		return true
+	end
+
+	if descendantsMentionDanger(instance) then
+		return true
+	end
+
+	return false
 end
 
-local function isDangerousInstance(instance)
-	if not instance then
+local function getRootPart(model)
+	if not model then
+		return nil
+	end
+
+	return model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("Torso")
+		or model:FindFirstChild("UpperTorso")
+end
+
+local function isRagdolled()
+	if not humanoid then
 		return false
 	end
 
-	local now = os.clock()
-	local cachedAt = dangerCacheTimes[instance]
+	local state = humanoid:GetState()
 
-	if cachedAt and now - cachedAt < CONFIG.DangerCacheLifetime then
-		return dangerCache[instance] == true
-	end
+	return state == Enum.HumanoidStateType.Physics
+		or state == Enum.HumanoidStateType.Ragdoll
+		or state == Enum.HumanoidStateType.FallingDown
+end
 
-	local result = isDangerousInstanceRaw(instance)
+local function updateRaycastParams()
+	local exclude = if character then { character } else {}
 
-	dangerCache[instance] = result
-	dangerCacheTimes[instance] = now
+	raycastParams.FilterDescendantsInstances = exclude
+	broadHazardOverlapParams.FilterDescendantsInstances = exclude
+end
 
-	return result
+local function setupCharacter(nextCharacter)
+	character = nextCharacter
+	humanoid = nextCharacter and nextCharacter:FindFirstChildOfClass("Humanoid") or nil
+	rootPart = getRootPart(nextCharacter)
+	updateRaycastParams()
 end
 
 local function pointInsidePartBounds(point, part, padding)
 	local localPoint = part.CFrame:PointToObjectSpace(point)
-	local half = part.Size * 0.5
+	local halfSize = part.Size * 0.5
 
-	return math.abs(localPoint.X) <= half.X + padding
-		and math.abs(localPoint.Y) <= half.Y + padding
-		and math.abs(localPoint.Z) <= half.Z + padding
+	return math.abs(localPoint.X) <= halfSize.X + padding
+		and math.abs(localPoint.Y) <= halfSize.Y + padding
+		and math.abs(localPoint.Z) <= halfSize.Z + padding
 end
 
 local function getDangerNearPoint(point, radius)
@@ -650,37 +570,29 @@ local function getNearestAcidDistance(position)
 	for _, part in ipairs(acidParts) do
 		if part.Parent then
 			local localPoint = part.CFrame:PointToObjectSpace(position)
-			local half = part.Size * 0.5
+			local halfSize = part.Size * 0.5
 
-			local dx = math.max(math.abs(localPoint.X) - half.X, 0)
-			local dy = math.max(math.abs(localPoint.Y) - half.Y, 0)
-			local dz = math.max(math.abs(localPoint.Z) - half.Z, 0)
+			local dx = math.max(math.abs(localPoint.X) - halfSize.X, 0)
+			local dy = math.max(math.abs(localPoint.Y) - halfSize.Y, 0)
+			local dz = math.max(math.abs(localPoint.Z) - halfSize.Z, 0)
 
-			nearest = math.min(nearest, Vector3.new(dx, dy, dz).Magnitude)
+			local distance = Vector3.new(dx, dy, dz).Magnitude
+
+			if distance < nearest then
+				nearest = distance
+			end
 		end
 	end
 
-	return nearest
-end
-
---------------------------------------------------------------------------
--- Prediction
---------------------------------------------------------------------------
-
-local function horizontal(v)
-	return Vector3.new(v.X, 0, v.Z)
-end
-
-local function safeSpherecast(origin, radius, displacement, params)
-	local ok, result = pcall(function()
-		return Workspace:Spherecast(origin, radius, displacement, params)
-	end)
-
-	if ok then
-		return result
+	if nearest < math.huge then
+		return nearest
 	end
 
-	return Workspace:Raycast(origin, displacement, params)
+	return 0
+end
+
+local function getHorizontal(vector)
+	return Vector3.new(vector.X, 0, vector.Z)
 end
 
 local function getMass()
@@ -693,12 +605,19 @@ end
 
 local function getDragAcceleration(velocity)
 	local speed = velocity.Magnitude
+
 	if speed <= 0.001 then
 		return Vector3.zero
 	end
 
-	local drag = 0.5 * CONFIG.AirDensity * CONFIG.DragCoefficient * CONFIG.CrossSectionArea * speed * speed
-	return -velocity.Unit * (drag / getMass())
+	local dragMagnitude = 0.5
+		* CONFIG.AirDensity
+		* CONFIG.DragCoefficient
+		* CONFIG.CrossSectionArea
+		* speed
+		* speed
+
+	return -velocity.Unit * (dragMagnitude / getMass())
 end
 
 local function getMagnusAcceleration(velocity, angularVelocity)
@@ -722,7 +641,7 @@ local function predictTrajectoryInternal()
 
 	local position = rootPart.Position
 	local velocity = rootPart.AssemblyLinearVelocity
-	local angular = rootPart.AssemblyAngularVelocity
+	local angularVelocity = rootPart.AssemblyAngularVelocity
 	local gravity = Vector3.new(0, -Workspace.Gravity, 0)
 	local trajectory = { position }
 
@@ -733,27 +652,27 @@ local function predictTrajectoryInternal()
 		stepIndex += 1
 
 		local step = math.min(CONFIG.PredictionTimeStep, CONFIG.PredictionMaxTime - elapsed)
-		local acceleration = gravity + getDragAcceleration(velocity) + getMagnusAcceleration(velocity, angular)
+		local acceleration = gravity + getDragAcceleration(velocity) + getMagnusAcceleration(velocity, angularVelocity)
 		local nextVelocity = velocity + acceleration * step
 		local nextPosition = position + velocity * step + 0.5 * acceleration * step * step
 		local displacement = nextPosition - position
 
 		if displacement.Magnitude > 0.001 then
-			local hit = safeSpherecast(position, CONFIG.CharacterRadius, displacement, raycastParams)
+			local hitResult = Workspace:Spherecast(position, CONFIG.CharacterRadius, displacement, raycastParams)
 
-			if hit then
-				local alpha = math.clamp(hit.Distance / displacement.Magnitude, 0, 1)
-				local rootPos = position:Lerp(nextPosition, alpha)
+			if hitResult then
+				local alpha = math.clamp(hitResult.Distance / displacement.Magnitude, 0, 1)
+				local rootPosition = position:Lerp(nextPosition, alpha)
 
-				table.insert(trajectory, rootPos)
+				table.insert(trajectory, rootPosition)
 
 				return {
 					Trajectory = trajectory,
-					HitResult = hit,
-					HitPart = hit.Instance,
-					LandPosition = hit.Position,
-					RootPosition = rootPos,
-					LandNormal = hit.Normal,
+					HitResult = hitResult,
+					HitPart = hitResult.Instance,
+					LandPosition = hitResult.Position,
+					RootPosition = rootPosition,
+					LandNormal = hitResult.Normal,
 					Time = elapsed + step * alpha,
 					Velocity = velocity:Lerp(nextVelocity, alpha),
 					Source = "Internal",
@@ -761,10 +680,11 @@ local function predictTrajectoryInternal()
 			end
 		end
 
-		if stepIndex % math.max(CONFIG.TrajectorySampleStride, 1) == 0 then
+		if stepIndex % CONFIG.TrajectorySampleStride == 0 then
 			table.insert(trajectory, nextPosition)
 
 			local dangerPart = getDangerNearPoint(nextPosition, CONFIG.TrajectoryDangerRadius)
+
 			if dangerPart then
 				return {
 					Trajectory = trajectory,
@@ -802,25 +722,25 @@ local function predictTrajectoryExternal()
 		return nil
 	end
 
-	local ok, trajectory, hitPart, hitResult, prediction = pcall(ExternalPredictPlayerLanding, LocalPlayer, {
-		MaxTime = CONFIG.PredictionMaxTime,
-		TimeStep = CONFIG.PredictionTimeStep,
-		Gravity = Workspace.Gravity,
-
-		AirDensity = CONFIG.AirDensity,
-		DragCoefficient = CONFIG.DragCoefficient,
-		CrossSectionArea = CONFIG.CrossSectionArea,
-		MagnusCoefficient = CONFIG.MagnusCoefficient,
-		MaxMagnusAcceleration = CONFIG.MaxMagnusAcceleration,
-
-		CastMode = "Sphere",
-		CastRadius = CONFIG.CharacterRadius,
-		CastPadding = 0.05,
-		IgnoreWater = true,
-
-		DrawArc = false,
-		ClearArc = false,
-	})
+	local ok, trajectory, hitPart, hitResult, prediction = pcall(
+		ExternalPredictPlayerLanding,
+		LocalPlayer,
+		{
+			MaxTime = CONFIG.PredictionMaxTime,
+			TimeStep = CONFIG.PredictionTimeStep,
+			Gravity = Workspace.Gravity,
+			AirDensity = CONFIG.AirDensity,
+			DragCoefficient = CONFIG.DragCoefficient,
+			CrossSectionArea = CONFIG.CrossSectionArea,
+			MagnusCoefficient = CONFIG.MagnusCoefficient,
+			MaxMagnusAcceleration = CONFIG.MaxMagnusAcceleration,
+			CastMode = "Sphere",
+			CastRadius = CONFIG.CharacterRadius,
+			CastPadding = 0.05,
+			IgnoreWater = true,
+			DrawArc = false,
+		}
+	)
 
 	if not ok then
 		Controller.LastError = tostring(trajectory)
@@ -840,21 +760,17 @@ local function predictTrajectoryExternal()
 end
 
 local function predictTrajectory()
-	return predictTrajectoryExternal() or predictTrajectoryInternal()
-end
+	local externalPrediction = predictTrajectoryExternal()
 
---------------------------------------------------------------------------
--- Danger classification and slide prediction
---------------------------------------------------------------------------
+	if externalPrediction then
+		return externalPrediction
+	end
+
+	return predictTrajectoryInternal()
+end
 
 local function getSurfaceVelocity(velocity, normal)
 	return velocity - normal * velocity:Dot(normal)
-end
-
-local function getGroundHit(position)
-	local origin = position + Vector3.new(0, CONFIG.SlideProbeHeight * 0.5, 0)
-	local displacement = Vector3.new(0, -CONFIG.SlideProbeHeight, 0)
-	return safeSpherecast(origin, CONFIG.SlideProbeRadius, displacement, raycastParams)
 end
 
 local function getSurfaceFriction(part)
@@ -862,8 +778,8 @@ local function getSurfaceFriction(part)
 		return CONFIG.DefaultSurfaceFriction
 	end
 
-	local props = part.CurrentPhysicalProperties
-	local friction = props and props.Friction or CONFIG.DefaultSurfaceFriction
+	local properties = part.CurrentPhysicalProperties
+	local friction = properties and properties.Friction or CONFIG.DefaultSurfaceFriction
 
 	if typeof(friction) ~= "number" or friction <= 0 then
 		return CONFIG.DefaultSurfaceFriction
@@ -872,12 +788,29 @@ local function getSurfaceFriction(part)
 	return friction
 end
 
+local function getGroundHit(position)
+	local origin = position + Vector3.new(0, CONFIG.SlideProbeHeight * 0.5, 0)
+	local displacement = Vector3.new(0, -CONFIG.SlideProbeHeight, 0)
+
+	return Workspace:Spherecast(origin, CONFIG.SlideProbeRadius, displacement, raycastParams)
+end
+
 local function simulateSlideDanger(prediction)
-	if not CONFIG.EnableSlidePrediction or not isRagdolled() or not prediction or not rootPart then
+	if not CONFIG.EnableSlidePrediction then
 		return nil
 	end
 
-	local groundHit = prediction.HitResult or getGroundHit(prediction.RootPosition or prediction.LandPosition or rootPart.Position)
+	if not prediction then
+		return nil
+	end
+
+	local hitResult = prediction.HitResult
+	local groundHit = hitResult
+
+	if not groundHit then
+		groundHit = getGroundHit(prediction.RootPosition or prediction.LandPosition or rootPart.Position)
+	end
+
 	if not groundHit then
 		return nil
 	end
@@ -892,33 +825,49 @@ local function simulateSlideDanger(prediction)
 	end
 
 	local normal = groundHit.Normal
-	if normal.Y <= 0.05 then
-		return nil
-	end
-
 	local position = prediction.RootPosition or prediction.LandPosition or groundHit.Position
 	local velocity = prediction.Velocity or rootPart.AssemblyLinearVelocity
 	local slideVelocity = getSurfaceVelocity(velocity, normal)
+	local ragdoll = isRagdolled()
 	local elapsed = 0
+
+	if ragdoll and not CONFIG.EnableRagdollSlidePrediction then
+		return nil
+	end
+
+	if not ragdoll and not CONFIG.EnableStandingSlidePrediction then
+		return nil
+	end
+
+	if not ragdoll then
+		slideVelocity *= CONFIG.StandingSlideVelocityMultiplier
+	end
+
+	if normal.Y <= 0.05 then
+		return nil
+	end
 
 	while elapsed < CONFIG.SlideLookahead do
 		local step = math.min(CONFIG.SlideTimeStep, CONFIG.SlideLookahead - elapsed)
 		local gravity = Vector3.new(0, -Workspace.Gravity, 0)
 		local slopeAcceleration = gravity - normal * gravity:Dot(normal)
 		local normalAcceleration = math.max(-gravity:Dot(normal), 0)
+		local surfaceFriction = getSurfaceFriction(groundHit.Instance)
+		local frictionMultiplier = if ragdoll then CONFIG.RagdollFrictionMultiplier else CONFIG.StandingFrictionMultiplier
+		local kineticFriction = surfaceFriction * frictionMultiplier
+		local staticFriction = kineticFriction * CONFIG.StaticFrictionMultiplier
 
-		local friction = getSurfaceFriction(groundHit.Instance) * CONFIG.RagdollFrictionMultiplier
-		local staticFriction = friction * CONFIG.StaticFrictionMultiplier
+		local minRequiredSlideSpeed = ragdoll and CONFIG.MinSlideSpeed or CONFIG.MinStandingSlideSpeed
 
-		if slideVelocity.Magnitude < CONFIG.MinSlideSpeed and slopeAcceleration.Magnitude <= staticFriction * normalAcceleration then
+		if slideVelocity.Magnitude < minRequiredSlideSpeed and slopeAcceleration.Magnitude <= staticFriction * normalAcceleration then
 			return nil
 		end
 
 		slideVelocity += slopeAcceleration * step
 
 		if slideVelocity.Magnitude > 0.001 then
-			local frictionMag = math.min(friction * normalAcceleration, slideVelocity.Magnitude / step)
-			slideVelocity -= slideVelocity.Unit * frictionMag * step
+			local frictionMagnitude = math.min(kineticFriction * normalAcceleration, slideVelocity.Magnitude / step)
+			slideVelocity -= slideVelocity.Unit * frictionMagnitude * step
 		end
 
 		if slideVelocity.Magnitude > CONFIG.MaxSlideSpeed then
@@ -932,6 +881,7 @@ local function simulateSlideDanger(prediction)
 		position += slideVelocity * step
 
 		local dangerPart = getDangerNearPoint(position, CONFIG.SlideDangerRadius)
+
 		if dangerPart then
 			return {
 				Kind = "SlideOverlap",
@@ -942,6 +892,7 @@ local function simulateSlideDanger(prediction)
 		end
 
 		groundHit = getGroundHit(position + normal * CONFIG.SlideSurfaceOffset)
+
 		if not groundHit then
 			return nil
 		end
@@ -958,7 +909,6 @@ local function simulateSlideDanger(prediction)
 		normal = groundHit.Normal
 		position = groundHit.Position + normal * CONFIG.SlideSurfaceOffset
 		slideVelocity = getSurfaceVelocity(slideVelocity, normal)
-
 		elapsed += step
 	end
 
@@ -970,13 +920,15 @@ local function scanTrajectoryForDanger(prediction)
 		return nil
 	end
 
-	local stride = math.max(math.floor(CONFIG.TrajectorySampleStride or 1), 1)
+	local trajectory = prediction.Trajectory
+	local stride = math.max(CONFIG.TrajectorySampleStride, 1)
 
-	for i = 1, #prediction.Trajectory, stride do
-		local point = prediction.Trajectory[i]
+	for index = 1, #trajectory, stride do
+		local point = trajectory[index]
 
 		if typeof(point) == "Vector3" then
 			local dangerPart = getDangerNearPoint(point, CONFIG.TrajectoryDangerRadius)
+
 			if dangerPart then
 				return {
 					Kind = "AirPath",
@@ -992,7 +944,7 @@ local function scanTrajectoryForDanger(prediction)
 end
 
 local function getPredictionDanger(prediction)
-	if not isRagdolled() or not prediction then
+	if not prediction then
 		return nil
 	end
 
@@ -1005,12 +957,17 @@ local function getPredictionDanger(prediction)
 		}
 	end
 
-	local air = scanTrajectoryForDanger(prediction)
-	if air then
-		return air
+	local airPathDanger = scanTrajectoryForDanger(prediction)
+
+	if airPathDanger then
+		return airPathDanger
 	end
 
-	local hitPart = prediction.HitPart or (prediction.HitResult and prediction.HitResult.Instance)
+	local hitPart = prediction.HitPart
+
+	if not hitPart and prediction.HitResult then
+		hitPart = prediction.HitResult.Instance
+	end
 
 	if isDangerousInstance(hitPart) then
 		return {
@@ -1024,57 +981,60 @@ local function getPredictionDanger(prediction)
 	return simulateSlideDanger(prediction)
 end
 
---------------------------------------------------------------------------
--- Redirect
---------------------------------------------------------------------------
-
-local function getClosestPointOnPartBounds(part, point)
+local function getClosestPointOnPartBounds(part, worldPoint)
 	if not part or not part:IsA("BasePart") then
 		return nil
 	end
 
-	local localPoint = part.CFrame:PointToObjectSpace(point)
-	local half = part.Size * 0.5
+	local localPoint = part.CFrame:PointToObjectSpace(worldPoint)
+	local halfSize = part.Size * 0.5
 
 	local clamped = Vector3.new(
-		math.clamp(localPoint.X, -half.X, half.X),
-		math.clamp(localPoint.Y, -half.Y, half.Y),
-		math.clamp(localPoint.Z, -half.Z, half.Z)
+		math.clamp(localPoint.X, -halfSize.X, halfSize.X),
+		math.clamp(localPoint.Y, -halfSize.Y, halfSize.Y),
+		math.clamp(localPoint.Z, -halfSize.Z, halfSize.Z)
 	)
 
 	return part.CFrame:PointToWorldSpace(clamped)
 end
 
-local function getEscapeDirectionFromPart(part, point)
+local function getEscapeDirectionFromPart(part, worldPoint)
 	if not part or not part:IsA("BasePart") then
 		return nil
 	end
 
-	local closest = getClosestPointOnPartBounds(part, point)
+	local localPoint = part.CFrame:PointToObjectSpace(worldPoint)
+	local halfSize = part.Size * 0.5
+
+	local closest = getClosestPointOnPartBounds(part, worldPoint)
 
 	if closest then
-		local away = horizontal(point - closest)
-		if away.Magnitude > 0.001 then
-			return away.Unit
+		local awayFromClosest = getHorizontal(worldPoint - closest)
+
+		if awayFromClosest.Magnitude > 0.001 then
+			return awayFromClosest.Unit
 		end
 	end
 
-	local localPoint = part.CFrame:PointToObjectSpace(point)
-	local half = part.Size * 0.5
-
-	local options = {
-		{ D = math.abs(half.X - localPoint.X), Dir = Vector3.new(1, 0, 0) },
-		{ D = math.abs(-half.X - localPoint.X), Dir = Vector3.new(-1, 0, 0) },
-		{ D = math.abs(half.Z - localPoint.Z), Dir = Vector3.new(0, 0, 1) },
-		{ D = math.abs(-half.Z - localPoint.Z), Dir = Vector3.new(0, 0, -1) },
+	local distances = {
+		{ Distance = math.abs(halfSize.X - localPoint.X), Direction = Vector3.new(1, 0, 0) },
+		{ Distance = math.abs(-halfSize.X - localPoint.X), Direction = Vector3.new(-1, 0, 0) },
+		{ Distance = math.abs(halfSize.Z - localPoint.Z), Direction = Vector3.new(0, 0, 1) },
+		{ Distance = math.abs(-halfSize.Z - localPoint.Z), Direction = Vector3.new(0, 0, -1) },
 	}
 
-	table.sort(options, function(a, b)
-		return a.D < b.D
+	table.sort(distances, function(a, b)
+		return a.Distance < b.Distance
 	end)
 
-	local dir = horizontal(part.CFrame:VectorToWorldSpace(options[1].Dir))
-	return dir.Magnitude > 0.001 and dir.Unit or nil
+	local worldDirection = part.CFrame:VectorToWorldSpace(distances[1].Direction)
+	worldDirection = getHorizontal(worldDirection)
+
+	if worldDirection.Magnitude > 0.001 then
+		return worldDirection.Unit
+	end
+
+	return nil
 end
 
 local function getDangerDistance(danger)
@@ -1088,6 +1048,7 @@ local function getDangerDistance(danger)
 
 	if danger.Part and danger.Part:IsA("BasePart") then
 		local closest = getClosestPointOnPartBounds(danger.Part, rootPart.Position)
+
 		if closest then
 			return (rootPart.Position - closest).Magnitude
 		end
@@ -1106,50 +1067,63 @@ end
 
 local function getSafeVelocity(danger)
 	local currentVelocity = rootPart.AssemblyLinearVelocity
-	local currentHorizontal = horizontal(currentVelocity)
+	local currentHorizontal = getHorizontal(currentVelocity)
 
-	local desired
+	local desiredDirection = nil
 
 	if danger.Part and danger.Part:IsA("BasePart") then
-		desired = getEscapeDirectionFromPart(danger.Part, rootPart.Position)
+		desiredDirection = getEscapeDirectionFromPart(danger.Part, rootPart.Position)
 	end
 
-	if not desired and typeof(danger.Position) == "Vector3" then
-		local away = horizontal(rootPart.Position - danger.Position)
-		if away.Magnitude > 0.001 then
-			desired = away.Unit
+	if not desiredDirection and typeof(danger.Position) == "Vector3" then
+		local awayFromDangerPoint = getHorizontal(rootPart.Position - danger.Position)
+
+		if awayFromDangerPoint.Magnitude > 0.001 then
+			desiredDirection = awayFromDangerPoint.Unit
 		end
 	end
 
-	if not desired and currentHorizontal.Magnitude > 0.001 then
-		desired = -currentHorizontal.Unit
+	if not desiredDirection and currentHorizontal.Magnitude > 0.001 then
+		desiredDirection = (-currentHorizontal).Unit
 	end
 
-	if not desired then
-		local look = horizontal(rootPart.CFrame.LookVector)
-		desired = look.Magnitude > 0.001 and look.Unit or Vector3.new(1, 0, 0)
+	if not desiredDirection then
+		local look = getHorizontal(rootPart.CFrame.LookVector)
+
+		if look.Magnitude > 0.001 then
+			desiredDirection = look.Unit
+		end
 	end
 
-	local side = Vector3.new(-desired.Z, 0, desired.X)
+	if not desiredDirection then
+		desiredDirection = Vector3.new(1, 0, 0)
+	end
+
+	local side = Vector3.new(-desiredDirection.Z, 0, desiredDirection.X)
+
 	if side.Magnitude > 0.001 then
 		if currentHorizontal.Magnitude > 0.001 and currentHorizontal:Dot(side) < 0 then
 			side = -side
 		end
-		desired = (desired + side.Unit * CONFIG.SideBias).Unit
+
+		desiredDirection = (desiredDirection + side.Unit * CONFIG.SideBias).Unit
 	end
 
 	local dangerDistance = getDangerDistance(danger)
 	local dangerTime = getDangerTime(danger)
 
-	local emergency = dangerDistance <= CONFIG.EmergencyRedirectDistance or dangerTime <= CONFIG.EmergencyRedirectTime
+	local emergency = dangerDistance <= CONFIG.EmergencyRedirectDistance
+		or dangerTime <= CONFIG.EmergencyRedirectTime
+
+	local minSpeed = emergency and CONFIG.RedirectMaxHorizontalSpeed or CONFIG.RedirectHorizontalSpeed
 
 	local horizontalSpeed = math.clamp(
-		math.max(currentHorizontal.Magnitude, emergency and CONFIG.RedirectMaxHorizontalSpeed or CONFIG.RedirectHorizontalSpeed),
+		math.max(currentHorizontal.Magnitude, minSpeed),
 		CONFIG.RedirectHorizontalSpeed,
 		CONFIG.RedirectMaxHorizontalSpeed
 	)
 
-	local lift = string.find(danger.Kind or "", "Slide") and CONFIG.SlideRedirectLift or CONFIG.RedirectLift
+	local lift = if string.find(danger.Kind, "Slide") then CONFIG.SlideRedirectLift else CONFIG.RedirectLift
 
 	if emergency then
 		lift = math.max(lift, CONFIG.RedirectLift + 8)
@@ -1161,7 +1135,7 @@ local function getSafeVelocity(danger)
 		targetY = math.max(targetY, 24)
 	end
 
-	return desired * horizontalSpeed + Vector3.new(0, targetY, 0)
+	return desiredDirection * horizontalSpeed + Vector3.new(0, targetY, 0)
 end
 
 local function applyRedirect(deltaTime)
@@ -1169,24 +1143,18 @@ local function applyRedirect(deltaTime)
 		return
 	end
 
-	if not isRagdolled() then
-		Controller.LastDanger = nil
-		Controller.LastPrediction = nil
+	local danger = Controller.LastDanger
 
-		if CONFIG.ClearArcWhenIdle then
-			clearTrajectoryArc()
-		end
-
-		return
-	end
-
-	notifyThrottled("attempting_redirect", "Attempting redirect to safety", 2.5)
+	notifyHazardThrottled("attempting_redirect", "Attempting redirect to safety", 2.5)
 
 	local currentVelocity = rootPart.AssemblyLinearVelocity
-	local targetVelocity = getSafeVelocity(Controller.LastDanger)
+	local targetVelocity = getSafeVelocity(danger)
 
-	local emergency = getDangerDistance(Controller.LastDanger) <= CONFIG.EmergencyRedirectDistance
-		or getDangerTime(Controller.LastDanger) <= CONFIG.EmergencyRedirectTime
+	local dangerDistance = getDangerDistance(danger)
+	local dangerTime = getDangerTime(danger)
+
+	local emergency = dangerDistance <= CONFIG.EmergencyRedirectDistance
+		or dangerTime <= CONFIG.EmergencyRedirectTime
 
 	local alpha
 
@@ -1198,6 +1166,7 @@ local function applyRedirect(deltaTime)
 	end
 
 	local newVelocity = currentVelocity:Lerp(targetVelocity, math.clamp(alpha, 0, 1))
+
 	rootPart.AssemblyLinearVelocity = newVelocity
 
 	if CONFIG.ImpulseAssist and rootPart.AssemblyMass > 0 then
@@ -1211,9 +1180,35 @@ local function applyRedirect(deltaTime)
 	end
 end
 
---------------------------------------------------------------------------
--- Heartbeat
---------------------------------------------------------------------------
+local function shouldPredict()
+	if not rootPart or not rootPart.Parent then
+		return false
+	end
+
+	if nearestAcidDistance > CONFIG.ActivationDistance then
+		return false
+	end
+
+	local velocity = rootPart.AssemblyLinearVelocity
+	local horizontalVelocity = getHorizontal(velocity)
+
+	if velocity.Magnitude >= CONFIG.MinSpeedToPredict then
+		return true
+	end
+
+	if CONFIG.EnableSlidePrediction
+		and CONFIG.EnableStandingVelocitySlidePrediction
+		and not isRagdolled()
+		and horizontalVelocity.Magnitude >= CONFIG.MinStandingSlideSpeed then
+		return true
+	end
+
+	if isRagdolled() then
+		return true
+	end
+
+	return getDangerNearPoint(rootPart.Position, CONFIG.SlideDangerRadius) ~= nil
+end
 
 local function updateNearestAcid(deltaTime)
 	nearestCheckAccumulated += deltaTime
@@ -1231,36 +1226,6 @@ local function updateNearestAcid(deltaTime)
 	end
 end
 
-local function shouldPredict()
-	if not rootPart or not rootPart.Parent then
-		return false
-	end
-
-	if not isRagdolled() then
-		return false
-	end
-
-	if CONFIG.AlwaysPredictWhileRagdolled then
-		return true
-	end
-
-	local velocity = rootPart.AssemblyLinearVelocity
-
-	if velocity.Magnitude >= CONFIG.MinSpeedToPredict then
-		return true
-	end
-
-	if getDangerNearPoint(rootPart.Position, CONFIG.SlideDangerRadius) then
-		return true
-	end
-
-	if nearestAcidDistance <= CONFIG.ActivationDistance then
-		return true
-	end
-
-	return false
-end
-
 local function onHeartbeat(deltaTime)
 	if not Controller.Enabled then
 		Controller.LastDanger = nil
@@ -1273,31 +1238,8 @@ local function onHeartbeat(deltaTime)
 		return
 	end
 
-	acidResolveAccumulated += deltaTime
-	if acidResolveAccumulated >= 1 then
-		acidResolveAccumulated = 0
-		resolveAcidPitFolder(false)
-	end
-
-	if not character
-		or not character.Parent
-		or not humanoid
-		or not humanoid.Parent
-		or not rootPart
-		or not rootPart.Parent then
+	if not character or not character.Parent or not rootPart or not rootPart.Parent then
 		setupCharacter(LocalPlayer.Character)
-	end
-
-	if not isRagdolled() then
-		Controller.LastDanger = nil
-		Controller.LastPrediction = nil
-		lastDangerUntil = 0
-
-		if CONFIG.ClearArcWhenIdle then
-			clearTrajectoryArc()
-		end
-
-		return
 	end
 
 	updateNearestAcid(deltaTime)
@@ -1308,27 +1250,28 @@ local function onHeartbeat(deltaTime)
 
 		if shouldPredict() then
 			local prediction = predictTrajectory()
+			local danger = getPredictionDanger(prediction)
 
-			if prediction then
-				local danger = getPredictionDanger(prediction)
+			Controller.LastPrediction = prediction
+			drawTrajectoryArc(prediction, danger)
 
-				Controller.LastPrediction = prediction
-				drawTrajectoryArc(prediction, danger)
-
-				if danger then
-					if not Controller.LastDanger then
-						notifyThrottled("trajectory_detected", "Trajectory detected toward hazard", 2.5)
-					end
-
-					Controller.LastDanger = danger
-
-					local emergency = getDangerDistance(danger) <= CONFIG.EmergencyRedirectDistance
-						or getDangerTime(danger) <= CONFIG.EmergencyRedirectTime
-
-					lastDangerUntil = os.clock() + (emergency and math.max(CONFIG.ApplyWindow, 0.65) or CONFIG.ApplyWindow)
-				elseif os.clock() > lastDangerUntil then
-					Controller.LastDanger = nil
+			if danger then
+				if not Controller.LastDanger then
+					notifyHazardThrottled("trajectory_detected", "Trajectory detected toward acid", 2.5)
 				end
+
+				Controller.LastDanger = danger
+
+				local dangerDistance = getDangerDistance(danger)
+				local dangerTime = getDangerTime(danger)
+
+				if dangerDistance <= CONFIG.EmergencyRedirectDistance or dangerTime <= CONFIG.EmergencyRedirectTime then
+					lastDangerUntil = os.clock() + math.max(CONFIG.ApplyWindow, 0.65)
+				else
+					lastDangerUntil = os.clock() + CONFIG.ApplyWindow
+				end
+			elseif os.clock() > lastDangerUntil then
+				Controller.LastDanger = nil
 			end
 		elseif os.clock() > lastDangerUntil then
 			Controller.LastDanger = nil
@@ -1344,10 +1287,6 @@ local function onHeartbeat(deltaTime)
 		applyRedirect(deltaTime)
 	end
 end
-
---------------------------------------------------------------------------
--- Controller API
---------------------------------------------------------------------------
 
 function Controller.Start()
 	Controller.Enabled = true
@@ -1384,14 +1323,9 @@ function Controller.SetConfig(nextConfig)
 		return
 	end
 
-	for k, v in pairs(nextConfig) do
-		CONFIG[k] = v
+	for key, value in pairs(nextConfig) do
+		CONFIG[key] = value
 	end
-
-	CONFIG.RagdollOnly = true
-	CONFIG.EnableStandingSlidePrediction = false
-	CONFIG.EnableStandingVelocitySlidePrediction = false
-	CONFIG.EnableRagdollSlidePrediction = true
 end
 
 function Controller.SetPredictor(predictor)
@@ -1405,17 +1339,19 @@ function Controller.SetPredictor(predictor)
 end
 
 function Controller.IsRedirecting()
-	return Controller.Enabled == true
-		and Controller.LastDanger ~= nil
-		and os.clock() <= lastDangerUntil
-		and isRagdolled()
+	return Controller.LastDanger ~= nil and os.clock() <= lastDangerUntil
 end
 
 function Controller.Destroy()
 	Controller.Stop()
 
-	disconnectAll(connections)
-	disconnectAll(acidFolderConnections)
+	for _, connection in ipairs(connections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+
+	clearArray(connections)
 
 	if heartbeatConnection then
 		pcall(function()
@@ -1432,16 +1368,24 @@ function Controller.Destroy()
 	end
 end
 
---------------------------------------------------------------------------
--- Init
---------------------------------------------------------------------------
-
-resolveAcidPitFolder(false)
+rebuildAcidParts()
 setupCharacter(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())
 
-table.insert(connections, LocalPlayer.CharacterAdded:Connect(function(nextCharacter)
-	task.defer(setupCharacter, nextCharacter)
-end))
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(setupCharacter))
+
+if acidPitFolder then
+	table.insert(connections, acidPitFolder.DescendantAdded:Connect(function(instance)
+		if instance:IsA("BasePart") then
+			rebuildAcidParts()
+		end
+	end))
+
+	table.insert(connections, acidPitFolder.DescendantRemoving:Connect(function(instance)
+		if instance:IsA("BasePart") then
+			task.defer(rebuildAcidParts)
+		end
+	end))
+end
 
 heartbeatConnection = RunService.Heartbeat:Connect(onHeartbeat)
 

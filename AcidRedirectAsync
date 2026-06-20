@@ -42,7 +42,7 @@ local CONFIG = {
 
 	-- Important:
 	-- If true, the system ONLY redirects/predicts while ragdolled.
-	RagdollOnly = true,
+	RagdollOnly = false,
 
 	EnableNotifications = true,
 	NotificationCooldown = 1.75,

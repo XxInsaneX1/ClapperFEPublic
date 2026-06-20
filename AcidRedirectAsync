@@ -1,13 +1,6 @@
 --------------------------------------------------------------------------
--- AcidPit / Acid-only Trajectory Redirect v7
+-- AcidPit / Acid-only Trajectory Redirect v7 (Optimized)
 -- Acid-only · ragdoll redirect · reliable safe-path sweep
---
--- Fixed:
---   - Redirects specifically for acid and nothing else
---   - Notifications now clearly say acid was nearly hit / avoided
---   - More reliable redirect application
---   - Better AcidPit discovery/fallback scanning
---   - Does NOT auto-draw trajectory arcs unless ShowTrajectoryArc is enabled
 --------------------------------------------------------------------------
 
 local Players    = game:GetService("Players")
@@ -44,7 +37,6 @@ local CONFIG = {
 	NotificationCooldown = 1.35,
 
 	-- Acid-only detection.
-	-- Do NOT add generic words here if you only want acid redirects.
 	AcidKeywords = {
 		"acid",
 		"acidpit",
@@ -59,7 +51,6 @@ local CONFIG = {
 	AcidDescendantScanLimit = 160,
 
 	-- Optional debug arc for this API only.
-	-- Main GUI velocity tracers should be handled by Script 1 / Trajectory API.
 	ShowTrajectoryArc    = false,
 	ClearArcWhenIdle     = true,
 	ArcFolderName        = "__AcidRedirectTrajectoryArc",
@@ -94,7 +85,7 @@ local CONFIG = {
 	SafePathAngleStep     = 10,
 	SafePathMaxAngle      = 180,
 
-	-- Commit longer so ragdoll physics and anti-fling do not immediately erase it.
+	-- Commit windup duration.
 	SafePathCommitWindow = 0.38,
 
 	-- Slide prediction.
@@ -176,10 +167,6 @@ end
 ------------------------------------------------------------------------
 -- Acid folder discovery
 ------------------------------------------------------------------------
-
-local function lowerText(value)
-	return string.lower(tostring(value or ""))
-end
 
 local function textMentionsAcid(text)
 	if typeof(text) ~= "string" then return false end
@@ -264,7 +251,7 @@ local function findDefaultAcidPitFolder()
 		return acidPit
 	end
 
-	for _, instance in ipairs(Workspace:GetDescendants()) do
+	for _, instance in ipairs(Workspace:GetChildren()) do
 		if textMentionsAcid(instance.Name) then
 			if instance:IsA("Folder") or instance:IsA("Model") then
 				return instance
@@ -299,9 +286,10 @@ local raycastParams     = RaycastParams.new()
 local acidOverlapParams = OverlapParams.new()
 local broadOverlapParams = OverlapParams.new()
 
-local acidParts   = {}
-local acidPartSet = {}
-local connections = {}
+local acidParts       = {}
+local acidPartSet     = {}
+local acidCheckCache  = setmetatable({}, { __mode = "k" }) -- Weak-keys layout prevents memory leaks
+local connections     = {}
 
 local heartbeatConnection = nil
 
@@ -327,12 +315,6 @@ acidOverlapParams.RespectCanCollide = false
 broadOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
 broadOverlapParams.FilterDescendantsInstances = {}
 broadOverlapParams.RespectCanCollide = false
-
-local function clearArray(t)
-	for i = #t, 1, -1 do
-		t[i] = nil
-	end
-end
 
 local function clearSafePathState()
 	safePathFound = false
@@ -485,27 +467,37 @@ local function isAcidInstance(instance)
 		return true
 	end
 
+	-- Memoized lookup dictionary to prevent climbing tree hierarchies on frame tasks.
+	if acidCheckCache[instance] ~= nil then
+		return acidCheckCache[instance]
+	end
+
 	if acidPitFolder and instance:IsDescendantOf(acidPitFolder) then
+		acidCheckCache[instance] = true
 		return true
 	end
 
 	if not CONFIG.EnableAcidNameDetection and not CONFIG.EnableAcidAttributeDetection then
+		acidCheckCache[instance] = false
 		return false
 	end
 
 	if ancestryMentionsAcid(instance) then
+		acidCheckCache[instance] = true
 		return true
 	end
 
 	if descendantsMentionAcid(instance) then
+		acidCheckCache[instance] = true
 		return true
 	end
 
+	acidCheckCache[instance] = false
 	return false
 end
 
 local function rebuildAcidParts()
-	clearArray(acidParts)
+	table.clear(acidParts)
 
 	for part in pairs(acidPartSet) do
 		acidPartSet[part] = nil
@@ -545,6 +537,17 @@ local function rebuildAcidParts()
 	else
 		acidOverlapParams.FilterDescendantsInstances = {}
 	end
+end
+
+-- Debounced rebuild call ensures multiple fast stream loads do not stack lag spikes.
+local rebuildPending = false
+local function queueRebuild()
+	if rebuildPending then return end
+	rebuildPending = true
+	task.defer(function()
+		rebuildPending = false
+		rebuildAcidParts()
+	end)
 end
 
 ------------------------------------------------------------------------
@@ -629,7 +632,7 @@ local function getAcidNearPoint(point, radius)
 		end
 	end
 
-	-- Fallback broad scan, but still acid-only.
+	-- Fallback broad scan (acid-only).
 	local ok, parts = pcall(function()
 		return Workspace:GetPartBoundsInRadius(point, math.max(radius, 9), broadOverlapParams)
 	end)
@@ -1306,12 +1309,16 @@ end
 local function updateAcidCache(deltaTime)
 	cacheRebuildAccumulated += deltaTime
 
-	if cacheRebuildAccumulated < 2.5 then
+	if cacheRebuildAccumulated < 3.0 then
 		return
 	end
 
 	cacheRebuildAccumulated = 0
-	rebuildAcidParts()
+	
+	-- Only force-refresh if cache tracking drops clean in high configurations.
+	if CONFIG.EnableWorkspaceAcidCache and #acidParts == 0 then
+		queueRebuild()
+	end
 end
 
 ------------------------------------------------------------------------
@@ -1527,7 +1534,7 @@ function Controller.SetConfig(nextConfig)
 		deg += CONFIG.SafePathAngleStep
 	end
 
-	rebuildAcidParts()
+	queueRebuild()
 end
 
 function Controller.SetPredictor(predictor)
@@ -1541,12 +1548,11 @@ function Controller.SetPredictor(predictor)
 end
 
 function Controller.RebuildAcid()
-	rebuildAcidParts()
+	queueRebuild()
 end
 
 function Controller.RebuildHazards()
-	-- Backward-compatible alias.
-	rebuildAcidParts()
+	queueRebuild()
 end
 
 function Controller.GetAcidParts()
@@ -1575,7 +1581,7 @@ function Controller.Destroy()
 		end)
 	end
 
-	clearArray(connections)
+	table.clear(connections)
 
 	if heartbeatConnection then
 		pcall(function()
@@ -1596,7 +1602,7 @@ end
 -- Boot
 ------------------------------------------------------------------------
 
-rebuildAcidParts()
+queueRebuild()
 
 setupCharacter(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())
 
@@ -1610,17 +1616,18 @@ table.insert(connections, Workspace.DescendantAdded:Connect(function(inst)
 			if inst:IsA("BasePart") and isAcidInstance(inst) then
 				addAcidPart(inst)
 			elseif textMentionsAcid(inst.Name) or attributesMentionAcid(inst) then
-				rebuildAcidParts()
+				queueRebuild()
 			end
 		end
 	end)
 end))
 
 table.insert(connections, Workspace.DescendantRemoving:Connect(function(inst)
+	acidCheckCache[inst] = nil -- Free descriptor references on destruction
 	if acidPartSet[inst] then
-		task.defer(rebuildAcidParts)
+		queueRebuild()
 	elseif inst == acidPitFolder then
-		task.defer(rebuildAcidParts)
+		queueRebuild()
 	end
 end))
 

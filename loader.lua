@@ -1069,5 +1069,5 @@ global.__AntiFlingGuiController = {
 
 notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect is ready.")
 notify("WARNING", "This GUI has not been fully Anti-Cheat Tested.", 10)
-notify("Info", "Latest Release 6/19/2026 9:36 PM, Change: Fixed Acid", 60)
+notify("Info", "Latest Release 6/19/2026 9:36 PM, Change: Fixed Acid", 99999999999999999)
 print("[AntiFling] Loaded with synced Acid-Redirect GUI")

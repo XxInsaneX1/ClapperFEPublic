@@ -1,5 +1,6 @@
--- AcidPit / Hazard Trajectory Redirect v5
--- Expanded hazard detection + notifications + toggleable slide prediction
+-- AcidPit / Hazard Trajectory Redirect v6
+-- Ragdoll-only hazard redirect
+-- Expanded hazard detection + notifications + ragdoll-only slide prediction
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -29,6 +30,10 @@ end
 
 local CONFIG = {
 	Enabled = true,
+
+	-- Important:
+	-- If true, the system ONLY redirects/predicts while ragdolled.
+	RagdollOnly = true,
 
 	EnableNotifications = true,
 	NotificationCooldown = 1.75,
@@ -86,10 +91,11 @@ local CONFIG = {
 	MagnusCoefficient = 0.003,
 	MaxMagnusAcceleration = 45,
 
+	-- Slide prediction is now ragdoll-only.
 	EnableSlidePrediction = true,
-	EnableStandingSlidePrediction = true,
+	EnableStandingSlidePrediction = false,
 	EnableRagdollSlidePrediction = true,
-	EnableStandingVelocitySlidePrediction = true,
+	EnableStandingVelocitySlidePrediction = false,
 
 	SlideLookahead = 1.5,
 	SlideTimeStep = 1 / 12,
@@ -131,6 +137,12 @@ if typeof(loaderOptions.Config) == "table" then
 		CONFIG[key] = value
 	end
 end
+
+-- Force ragdoll-only even if the loader config tries to enable standing prediction.
+CONFIG.RagdollOnly = true
+CONFIG.EnableStandingSlidePrediction = false
+CONFIG.EnableStandingVelocitySlidePrediction = false
+CONFIG.EnableRagdollSlidePrediction = true
 
 local notifyTimes = {}
 
@@ -800,6 +812,10 @@ local function simulateSlideDanger(prediction)
 		return nil
 	end
 
+	if CONFIG.RagdollOnly and not isRagdolled() then
+		return nil
+	end
+
 	if not prediction then
 		return nil
 	end
@@ -944,6 +960,10 @@ local function scanTrajectoryForDanger(prediction)
 end
 
 local function getPredictionDanger(prediction)
+	if CONFIG.RagdollOnly and not isRagdolled() then
+		return nil
+	end
+
 	if not prediction then
 		return nil
 	end
@@ -1143,6 +1163,17 @@ local function applyRedirect(deltaTime)
 		return
 	end
 
+	if CONFIG.RagdollOnly and not isRagdolled() then
+		Controller.LastDanger = nil
+		Controller.LastPrediction = nil
+
+		if CONFIG.ClearArcWhenIdle then
+			clearTrajectoryArc()
+		end
+
+		return
+	end
+
 	local danger = Controller.LastDanger
 
 	notifyHazardThrottled("attempting_redirect", "Attempting redirect to safety", 2.5)
@@ -1185,21 +1216,17 @@ local function shouldPredict()
 		return false
 	end
 
+	if CONFIG.RagdollOnly and not isRagdolled() then
+		return false
+	end
+
 	if nearestAcidDistance > CONFIG.ActivationDistance then
 		return false
 	end
 
 	local velocity = rootPart.AssemblyLinearVelocity
-	local horizontalVelocity = getHorizontal(velocity)
 
 	if velocity.Magnitude >= CONFIG.MinSpeedToPredict then
-		return true
-	end
-
-	if CONFIG.EnableSlidePrediction
-		and CONFIG.EnableStandingVelocitySlidePrediction
-		and not isRagdolled()
-		and horizontalVelocity.Magnitude >= CONFIG.MinStandingSlideSpeed then
 		return true
 	end
 
@@ -1240,6 +1267,18 @@ local function onHeartbeat(deltaTime)
 
 	if not character or not character.Parent or not rootPart or not rootPart.Parent then
 		setupCharacter(LocalPlayer.Character)
+	end
+
+	if CONFIG.RagdollOnly and not isRagdolled() then
+		Controller.LastDanger = nil
+		Controller.LastPrediction = nil
+		lastDangerUntil = 0
+
+		if CONFIG.ClearArcWhenIdle then
+			clearTrajectoryArc()
+		end
+
+		return
 	end
 
 	updateNearestAcid(deltaTime)
@@ -1326,6 +1365,11 @@ function Controller.SetConfig(nextConfig)
 	for key, value in pairs(nextConfig) do
 		CONFIG[key] = value
 	end
+
+	CONFIG.RagdollOnly = true
+	CONFIG.EnableStandingSlidePrediction = false
+	CONFIG.EnableStandingVelocitySlidePrediction = false
+	CONFIG.EnableRagdollSlidePrediction = true
 end
 
 function Controller.SetPredictor(predictor)
@@ -1339,7 +1383,7 @@ function Controller.SetPredictor(predictor)
 end
 
 function Controller.IsRedirecting()
-	return Controller.LastDanger ~= nil and os.clock() <= lastDangerUntil
+	return Controller.LastDanger ~= nil and os.clock() <= lastDangerUntil and isRagdolled()
 end
 
 function Controller.Destroy()

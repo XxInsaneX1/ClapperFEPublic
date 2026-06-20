@@ -1,26 +1,26 @@
 --!nonstrict
--- Acid-Redirect v9 (Standalone LocalScript, ragdoll-only smooth redirect)
--- Drop into your executor / StarterPlayerScripts. Re-execute to toggle off.
+-- Acid-Redirect v10 (Module chunk for the AntiFling loader)
+-- Loaded via: pcall(loadstring(HttpGet(url)), { PredictPlayerLanding=, Notify=, Config=, ... })
+-- Returns a controller table the loader drives (Start/Stop/Destroy/HideArc/ClearArc/SetPredictor/IsRedirecting).
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace  = game:GetService("Workspace")
-local StarterGui = game:GetService("StarterGui")
 local LocalPlayer = Players.LocalPlayer
 
-----------------------------------------------------------------------
--- Single-instance guard (so re-executing doesn't stack heartbeats)
-----------------------------------------------------------------------
-local G = (typeof(getgenv) == "function") and getgenv() or _G
-if G.__AcidRedirect and G.__AcidRedirect.Destroy then
-	pcall(G.__AcidRedirect.Destroy)
-	G.__AcidRedirect = nil
-	-- second execution = turn it off
-	return
-end
+local global = (typeof(getgenv) == "function") and getgenv() or _G
 
 ----------------------------------------------------------------------
--- Config (override via getgenv().AcidRedirectConfig before executing)
+-- Loader options (passed through ...)
+----------------------------------------------------------------------
+local loaderOptions = ...
+if typeof(loaderOptions) ~= "table" then loaderOptions = {} end
+
+local NotifyCallback = (typeof(loaderOptions.Notify) == "function") and loaderOptions.Notify or nil
+local ExternalPredictPlayerLanding = (typeof(loaderOptions.PredictPlayerLanding) == "function") and loaderOptions.PredictPlayerLanding or nil
+
+----------------------------------------------------------------------
+-- Config
 ----------------------------------------------------------------------
 local CONFIG = {
 	Enabled = true,
@@ -32,10 +32,11 @@ local CONFIG = {
 	EnableAcidNameDetection = true,
 	EnableAcidAttributeDetection = true,
 	EnableWorkspaceAcidCache = true,
+	EnableBroadHazardScan = true,
 	WorkspaceCacheScanLimit = 10000,
 	AcidDescendantScanLimit = 160,
 
-	-- Arc debug
+	-- Arc debug (loader keeps these OFF; tracers are drawn by the loader itself)
 	ShowTrajectoryArc = false,
 	ClearArcWhenIdle = true,
 	ArcFolderName = "__AcidRedirectTrajectoryArc",
@@ -74,6 +75,8 @@ local CONFIG = {
 	-- Slide prediction
 	EnableSlidePrediction = true,
 	EnableRagdollSlidePrediction = true,
+	EnableStandingSlide = true,          -- aliased from EnableStandingSlidePrediction
+	EnableStandingVelocitySlide = true,  -- aliased from EnableStandingVelocitySlidePrediction
 	SlideLookahead = 1.75,
 	SlideTimeStep = 1/14,
 	SlideDangerRadius = 3.35,
@@ -90,8 +93,8 @@ local CONFIG = {
 	RedirectHorizontalSpeed = 58,
 	RedirectMaxHorizontalSpeed = 108,
 	RedirectLift = 34,
-	PreserveOriginalSpin = true,   -- replicate the ragdoll tumble
-	ExtraArcLift = 0,              -- raise to fling the corrected arc higher/longer
+	PreserveOriginalSpin = true,
+	ExtraArcLift = 0,
 
 	-- Emergency fallback
 	EmergencyRedirectEnabled = true,
@@ -107,19 +110,31 @@ local CONFIG = {
 	ImpulseCapPerMass = 30,
 }
 
-if typeof(G.AcidRedirectConfig) == "table" then
-	for k,v in pairs(G.AcidRedirectConfig) do CONFIG[k] = v end
+-- Merge loader config, then alias the loader's hazard-naming to our internal keys.
+if typeof(loaderOptions.Config) == "table" then
+	for k,v in pairs(loaderOptions.Config) do CONFIG[k] = v end
+end
+if typeof(loaderOptions.ShowTrajectoryArc) == "boolean" then
+	CONFIG.ShowTrajectoryArc = loaderOptions.ShowTrajectoryArc
 end
 
--- Optional external hooks (set these in getgenv before running if you have them)
-local NotifyCallback = (typeof(G.AcidRedirectNotify) == "function") and G.AcidRedirectNotify or nil
-local ExternalPredictPlayerLanding = (typeof(G.AcidRedirectPredictLanding) == "function") and G.AcidRedirectPredictLanding or nil
+local function applyConfigAliases()
+	local function alias(from, to)
+		if CONFIG[from] ~= nil then CONFIG[to] = CONFIG[from] end
+	end
+	alias("EnableKeywordHazardDetection", "EnableAcidNameDetection")
+	alias("EnableWorkspaceHazardCache", "EnableWorkspaceAcidCache")
+	alias("EnableStandingSlidePrediction", "EnableStandingSlide")
+	alias("EnableStandingVelocitySlidePrediction", "EnableStandingVelocitySlide")
+end
+applyConfigAliases()
 
 ----------------------------------------------------------------------
 -- State
 ----------------------------------------------------------------------
 local Controller = {
 	Enabled = CONFIG.Enabled,
+	Running = false,
 	LastDanger = nil,
 	LastPrediction = nil,
 	LastAcidPart = nil,
@@ -148,32 +163,25 @@ local acidPartSet = {}
 local acidCheckCache = setmetatable({}, { __mode = "k" })
 local overlapSupported = true
 
-local conns = {}
 local heartbeatConn = nil
+local charAddedConn = nil
+local charRemovingConn = nil
 local accumulatedPredict = 0
 
 local safePathFound = false
 local safePathFoundAt = 0
 local safePathVelocity = Vector3.zero
 local safePathAngularVelocity = Vector3.zero
+local safePathHasSpin = false
 
 local notifyTimes = {}
 
 ----------------------------------------------------------------------
--- Notifications (executor-safe fallback)
+-- Notify
 ----------------------------------------------------------------------
 local function notify(title, message, duration)
-	if NotifyCallback then
-		pcall(function() NotifyCallback(title, message, duration or 2.5) end)
-		return
-	end
-	pcall(function()
-		StarterGui:SetCore("SendNotification", {
-			Title = title,
-			Text = message,
-			Duration = duration or 2.5,
-		})
-	end)
+	if not NotifyCallback then return end
+	pcall(function() NotifyCallback(title, message, duration or 2.5) end)
 end
 
 local function notifyThrottled(key, message, duration)
@@ -186,7 +194,7 @@ local function notifyThrottled(key, message, duration)
 end
 
 ----------------------------------------------------------------------
--- Acid detection helpers
+-- Acid detection
 ----------------------------------------------------------------------
 local function textMentionsAcid(text)
 	if typeof(text) ~= "string" then return false end
@@ -331,6 +339,7 @@ local function setupCharacter(nextCharacter)
 	safePathFoundAt = 0
 	safePathVelocity = Vector3.zero
 	safePathAngularVelocity = Vector3.zero
+	safePathHasSpin = false
 	Controller.LastDanger = nil
 	Controller.LastPrediction = nil
 	Controller.LastAcidPart = nil
@@ -364,14 +373,16 @@ local function getAcidNearPoint(point, radius)
 	for _, p in ipairs(acidParts) do
 		if p.Parent and pointInsidePartBounds(point, p, radius) then return p end
 	end
-	local ok, parts = pcall(function()
-		return Workspace:GetPartBoundsInRadius(point, math.max(radius, 9), broadOverlapParams)
-	end)
-	if ok and parts then
-		for _, p in ipairs(parts) do
-			if p:IsA("BasePart") and isAcidInstance(p) then
-				addAcidPart(p)
-				return p
+	if CONFIG.EnableBroadHazardScan then
+		local ok, parts = pcall(function()
+			return Workspace:GetPartBoundsInRadius(point, math.max(radius, 9), broadOverlapParams)
+		end)
+		if ok and parts then
+			for _, p in ipairs(parts) do
+				if p:IsA("BasePart") and isAcidInstance(p) then
+					addAcidPart(p)
+					return p
+				end
 			end
 		end
 	end
@@ -596,9 +607,11 @@ local function getGroundHit(position)
 	return Workspace:Raycast(origin, displacement, raycastParams)
 end
 
-local function simulateSlideAcidDanger(prediction)
+-- Slide simulation works for ragdoll AND standing; friction multiplier depends on state.
+local function simulateSlideAcidDanger(prediction, ragdoll)
 	if not CONFIG.EnableSlidePrediction then return nil end
-	if not CONFIG.EnableRagdollSlidePrediction then return nil end
+	if ragdoll and not CONFIG.EnableRagdollSlidePrediction then return nil end
+	if (not ragdoll) and not (CONFIG.EnableStandingSlide or CONFIG.EnableStandingVelocitySlide) then return nil end
 	if not prediction or not rootPart then return nil end
 
 	local groundHit = prediction.HitResult
@@ -614,6 +627,7 @@ local function simulateSlideAcidDanger(prediction)
 	local position = prediction.RootPosition or prediction.LandPosition or groundHit.Position
 	local velocity = prediction.Velocity or rootPart.AssemblyLinearVelocity
 	local slideVelocity = getSurfaceVelocity(velocity, normal)
+	local frictionScale = ragdoll and CONFIG.RagdollFrictionMultiplier or 1
 	local elapsed = 0
 
 	if normal.Y <= 0.05 then return nil end
@@ -624,7 +638,7 @@ local function simulateSlideAcidDanger(prediction)
 		local slopeAcceleration = gravity - normal * gravity:Dot(normal)
 		local normalAcceleration = math.max(-gravity:Dot(normal), 0)
 		local surfaceFriction = getSurfaceFriction(groundHit.Instance)
-		local kineticFriction = surfaceFriction * CONFIG.RagdollFrictionMultiplier
+		local kineticFriction = surfaceFriction * frictionScale
 		local staticFriction = kineticFriction * CONFIG.StaticFrictionMultiplier
 
 		if slideVelocity.Magnitude < CONFIG.MinSlideSpeed and slopeAcceleration.Magnitude <= staticFriction * normalAcceleration then
@@ -667,7 +681,7 @@ local function simulateSlideAcidDanger(prediction)
 	return nil
 end
 
-local function getPredictionAcidDanger(prediction)
+local function getPredictionAcidDanger(prediction, ragdoll)
 	if not prediction then return nil end
 	if prediction.NearAcidPart then
 		return { Kind = "AirPathAcid", Part = prediction.NearAcidPart, Position = prediction.LandPosition or prediction.RootPosition, Prediction = prediction }
@@ -679,11 +693,11 @@ local function getPredictionAcidDanger(prediction)
 	if isAcidInstance(hitPart) then
 		return { Kind = "DirectAcidHit", Part = hitPart, Position = prediction.LandPosition or prediction.RootPosition, Prediction = prediction }
 	end
-	return simulateSlideAcidDanger(prediction)
+	return simulateSlideAcidDanger(prediction, ragdoll)
 end
 
 ----------------------------------------------------------------------
--- Arc drawing (optional debug)
+-- Arc drawing (kept, but loader keeps it OFF)
 ----------------------------------------------------------------------
 local function getArcFolder()
 	local folder = Workspace:FindFirstChild(CONFIG.ArcFolderName)
@@ -758,8 +772,7 @@ end
 ----------------------------------------------------------------------
 -- Redirect application
 ----------------------------------------------------------------------
--- Raw push (no commit timestamp). Preserves the original spin.
-local function pushVelocity(velocity, angularVelocity, withImpulse)
+local function pushVelocity(velocity, angularVelocity, withImpulse, applySpin)
 	if not rootPart or not rootPart.Parent then return end
 
 	local currentVel = rootPart.AssemblyLinearVelocity  -- captured BEFORE assignment (impulse-delta fix)
@@ -767,7 +780,7 @@ local function pushVelocity(velocity, angularVelocity, withImpulse)
 	pcall(function() rootPart.AssemblyLinearVelocity = velocity end)
 	pcall(function() rootPart.Velocity = velocity end)
 
-	if CONFIG.PreserveOriginalSpin and angularVelocity then
+	if applySpin and CONFIG.PreserveOriginalSpin and angularVelocity then
 		pcall(function() rootPart.AssemblyAngularVelocity = angularVelocity end)
 	end
 
@@ -787,12 +800,12 @@ local function pushVelocity(velocity, angularVelocity, withImpulse)
 	end
 end
 
--- Commit redirect: push + record state for the reapplication window.
-local function applyRedirectVelocity(velocity, angularVelocity)
-	pushVelocity(velocity, angularVelocity, true)
+local function applyRedirectVelocity(velocity, angularVelocity, applySpin)
+	pushVelocity(velocity, angularVelocity, true, applySpin)
 	safePathFound = true
 	safePathFoundAt = os.clock()
 	safePathVelocity = velocity
+	safePathHasSpin = applySpin == true and angularVelocity ~= nil
 	safePathAngularVelocity = angularVelocity or rootPart.AssemblyAngularVelocity
 end
 
@@ -834,7 +847,7 @@ local function simulateCandidateSafe(startPos, candidateVel)
 	return true
 end
 
--- Sweep: keep the original arc straight + extended, smallest deviation first.
+-- Keep the original arc straight + extended; smallest deviation first.
 local function findSafeRedirect(prediction, danger)
 	if not prediction or not rootPart then return nil end
 
@@ -842,7 +855,6 @@ local function findSafeRedirect(prediction, danger)
 	local currentVel = rootPart.AssemblyLinearVelocity
 	local horizVel = getHorizontal(currentVel)
 
-	-- Base direction = continuation of the ORIGINAL arc (keeps it straight/smooth).
 	local baseDir
 	if horizVel.Magnitude > 0.5 then
 		baseDir = horizVel.Unit
@@ -850,7 +862,6 @@ local function findSafeRedirect(prediction, danger)
 		baseDir = getNearestAcidDirectionAway(startPos) or safeHorizontalUnit(rootPart.CFrame.LookVector)
 	end
 
-	-- For ground/slide danger, bias toward "away" so we push out of the slide.
 	if danger and (danger.Kind == "SlideIntoAcid" or danger.Kind == "SlideGroundAcid" or danger.Kind == "DirectAcidHit") then
 		local awayDir = getNearestAcidDirectionAway(startPos)
 		if awayDir then
@@ -859,7 +870,6 @@ local function findSafeRedirect(prediction, danger)
 		end
 	end
 
-	-- Extend the arc: keep/boost horizontal speed, preserve upward velocity + lift.
 	local horizSpeed = math.clamp(
 		math.max(horizVel.Magnitude, CONFIG.RedirectHorizontalSpeed),
 		CONFIG.RedirectHorizontalSpeed,
@@ -867,7 +877,6 @@ local function findSafeRedirect(prediction, danger)
 	)
 	local liftY = math.max(currentVel.Y, 0) + CONFIG.RedirectLift + CONFIG.ExtraArcLift
 
-	-- 0 (dead straight) first, then ±step, ±2step ... lowest deviation wins.
 	local angles = {0}
 	local deg = CONFIG.SafePathAngleStep
 	while deg <= CONFIG.SafePathMaxAngle do
@@ -884,7 +893,6 @@ local function findSafeRedirect(prediction, danger)
 		end
 	end
 
-	-- Emergency: hardest push straight away from nearest acid.
 	if CONFIG.EmergencyRedirectEnabled then
 		local away = getNearestAcidDirectionAway(startPos) or safeHorizontalUnit(rootPart.CFrame.LookVector)
 		return away * CONFIG.EmergencyHorizontalSpeed + Vector3.new(0, CONFIG.EmergencyLift, 0), nil
@@ -894,13 +902,30 @@ local function findSafeRedirect(prediction, danger)
 end
 
 ----------------------------------------------------------------------
--- Main cycle (RAGDOLL ONLY)
+-- IsRedirecting (true through the whole commit window so AntiFling loosens)
+----------------------------------------------------------------------
+local function isRedirecting()
+	if not Controller.Enabled then return false end
+	if safePathFound then
+		local age = os.clock() - safePathFoundAt
+		if age <= CONFIG.SafePathCommitWindow then return true end
+	end
+	return Controller.LastDanger ~= nil
+end
+
+----------------------------------------------------------------------
+-- Main cycle
 ----------------------------------------------------------------------
 local function runPredictionCycle()
 	if not Controller.Enabled or not rootPart or not rootPart.Parent then return end
 
-	if not isRagdolled() then
-		Controller.LastDanger = nil
+	local ragdoll = isRagdolled()
+	local standingAllowed = CONFIG.EnableStandingSlide or CONFIG.EnableStandingVelocitySlide
+
+	-- Operate while ragdolled, or while standing IF the loader enabled standing slide prediction.
+	if not ragdoll and not standingAllowed then
+		-- Don't wipe LastDanger mid-commit (keeps AntiFling loosened for the full window).
+		if not isRedirecting() then Controller.LastDanger = nil end
 		if CONFIG.ClearArcWhenIdle then clearTrajectoryArc() end
 		return
 	end
@@ -909,24 +934,29 @@ local function runPredictionCycle()
 	Controller.LastPrediction = prediction
 	if not prediction then return end
 
-	local danger = getPredictionAcidDanger(prediction)
-	Controller.LastDanger = danger
+	local danger = getPredictionAcidDanger(prediction, ragdoll)
+
 	if danger then
+		Controller.LastDanger = danger
 		Controller.LastAcidPart = danger.Part
-		local originalAngular = rootPart.AssemblyAngularVelocity  -- capture the spin to replicate
+		local applySpin = ragdoll
+		local originalAngular = ragdoll and rootPart.AssemblyAngularVelocity or nil
+
 		notifyThrottled("acid_detected", "Acid danger predicted; attempting redirect.")
 		drawTrajectoryArc(prediction, danger)
 
 		local candidate, angle = findSafeRedirect(prediction, danger)
 		if candidate then
-			applyRedirectVelocity(candidate, originalAngular)
+			applyRedirectVelocity(candidate, originalAngular, applySpin)
 			if angle then
-				notifyThrottled("redirect_applied", string.format("Redirect applied (%d°) to avoid acid.", angle))
+				notifyThrottled("redirect_applied", string.format("Redirect applied (%d deg) to avoid acid.", angle))
 			else
 				notifyThrottled("redirect_applied", "Emergency redirect applied to avoid acid.")
 			end
 		end
 	else
+		-- Keep LastDanger populated through the commit window; otherwise clear.
+		if not isRedirecting() then Controller.LastDanger = nil end
 		if CONFIG.ShowTrajectoryArc then
 			drawTrajectoryArc(prediction, nil)
 		elseif CONFIG.ClearArcWhenIdle then
@@ -946,9 +976,9 @@ local function onHeartbeat(dt)
 	if safePathFound then
 		local age = os.clock() - safePathFoundAt
 		if age <= CONFIG.SafePathCommitWindow then
-			if isRagdolled() and (safePathVelocity - rootPart.AssemblyLinearVelocity).Magnitude > 1.5 then
+			if (safePathVelocity - rootPart.AssemblyLinearVelocity).Magnitude > 1.5 then
 				task.spawn(function()
-					pushVelocity(safePathVelocity, safePathAngularVelocity, false)
+					pushVelocity(safePathVelocity, safePathAngularVelocity, false, safePathHasSpin)
 				end)
 			end
 		else
@@ -956,6 +986,7 @@ local function onHeartbeat(dt)
 			safePathFoundAt = 0
 			safePathVelocity = Vector3.zero
 			safePathAngularVelocity = Vector3.zero
+			safePathHasSpin = false
 			if CONFIG.ClearArcWhenIdle then clearTrajectoryArc() end
 		end
 	end
@@ -971,13 +1002,24 @@ local function onHeartbeat(dt)
 end
 
 ----------------------------------------------------------------------
--- Wiring
+-- Lifecycle
 ----------------------------------------------------------------------
-local function onCharacterAdded(char)
-	setupCharacter(char)
+local function connectHeartbeat()
 	if not heartbeatConn then
 		heartbeatConn = RunService.Heartbeat:Connect(onHeartbeat)
 	end
+end
+
+local function disconnectHeartbeat()
+	if heartbeatConn then
+		heartbeatConn:Disconnect()
+		heartbeatConn = nil
+	end
+end
+
+local function onCharacterAdded(char)
+	setupCharacter(char)
+	if Controller.Running then connectHeartbeat() end
 end
 
 local function onCharacterRemoving()
@@ -985,42 +1027,89 @@ local function onCharacterRemoving()
 end
 
 if LocalPlayer then
-	if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
-	table.insert(conns, LocalPlayer.CharacterAdded:Connect(onCharacterAdded))
-	table.insert(conns, LocalPlayer.CharacterRemoving:Connect(onCharacterRemoving))
+	if LocalPlayer.Character then setupCharacter(LocalPlayer.Character) end
+	charAddedConn = LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+	charRemovingConn = LocalPlayer.CharacterRemoving:Connect(onCharacterRemoving)
 end
 
 rebuildAcidParts()
 
 ----------------------------------------------------------------------
--- Public control surface (lives in getgenv so you can poke it / toggle)
+-- Controller table (the API the loader actually calls)
 ----------------------------------------------------------------------
-G.__AcidRedirect = {
-	Controller = Controller,
-	Config = CONFIG,
-	Enable = function(val) Controller.Enabled = (val == nil) and true or (val == true) end,
-	RebuildAcidCache = rebuildAcidParts,
-	SetConfig = function(newConfig)
-		if typeof(newConfig) ~= "table" then return end
-		for k,v in pairs(newConfig) do CONFIG[k] = v end
-	end,
-	ForcePredict = function()
-		task.spawn(function()
-			local ok, err = pcall(runPredictionCycle)
-			if not ok then Controller.LastError = tostring(err) end
-		end)
-	end,
-	ForceRedirect = function(velocity, angularVelocity)
-		if typeof(velocity) ~= "Vector3" then return end
-		applyRedirectVelocity(velocity, angularVelocity)
-	end,
-	Destroy = function()
-		Controller.Enabled = false
-		if heartbeatConn then heartbeatConn:Disconnect() heartbeatConn = nil end
-		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-		table.clear(conns)
-		clearTrajectoryArc()
-	end,
-}
+Controller.Start = function()
+	Controller.Enabled = true
+	Controller.Running = true
+	connectHeartbeat()
+end
 
-notify("Acid-Redirect", "Loaded (ragdoll-only). Re-execute to unload.", 3)
+Controller.Stop = function()
+	Controller.Running = false
+	Controller.Enabled = false
+	disconnectHeartbeat()
+	safePathFound = false
+	Controller.LastDanger = nil
+	clearTrajectoryArc()
+end
+
+Controller.Destroy = function()
+	Controller.Stop()
+	if charAddedConn then charAddedConn:Disconnect() charAddedConn = nil end
+	if charRemovingConn then charRemovingConn:Disconnect() charRemovingConn = nil end
+	if global.__AcidRedirectController == Controller then
+		global.__AcidRedirectController = nil
+	end
+end
+
+Controller.HideArc = function() clearTrajectoryArc() end
+Controller.ClearArc = function() clearTrajectoryArc() end
+
+Controller.SetPredictor = function(predictor)
+	if typeof(predictor) == "function" then
+		ExternalPredictPlayerLanding = predictor
+		Controller.UsingExternalTrajectoryApi = true
+	end
+end
+
+Controller.IsRedirecting = function() return isRedirecting() end
+
+Controller.Enable = function(val)
+	Controller.Enabled = (val == nil) and true or (val == true)
+end
+
+Controller.RebuildAcidCache = function() rebuildAcidParts() end
+
+Controller.SetConfig = function(newConfig)
+	if typeof(newConfig) ~= "table" then return end
+	for k,v in pairs(newConfig) do CONFIG[k] = v end
+	applyConfigAliases()
+end
+
+Controller.GetState = function()
+	return {
+		Controller = Controller,
+		Config = CONFIG,
+		Character = character,
+		RootPart = rootPart,
+		Ragdolled = isRagdolled(),
+		Redirecting = isRedirecting(),
+	}
+end
+
+Controller.ForcePredict = function()
+	task.spawn(function()
+		local ok, err = pcall(runPredictionCycle)
+		if not ok then Controller.LastError = tostring(err) end
+	end)
+end
+
+Controller.ForceRedirect = function(velocity, angularVelocity)
+	if typeof(velocity) ~= "Vector3" then return end
+	applyRedirectVelocity(velocity, angularVelocity, angularVelocity ~= nil)
+end
+
+-- Auto-start (loader expects it live after the chunk returns) and publish globally.
+Controller.Start()
+global.__AcidRedirectController = Controller
+
+return Controller

@@ -72,7 +72,7 @@ local CONFIG = {
 	EnableSlidePrediction        = true,
 	EnableRagdollSlidePrediction = true,
 
-	RedirectOnlyWhenRagdolled = false,
+	RedirectOnlyWhenRagdolled = true,
 	RequireTrajectoryApi      = false,
 
 	EnableStandingSlide         = false,

@@ -648,8 +648,8 @@ local function startAcidRedirect()
 				notify(titleText, bodyText, duration)
 			end,
 
-			Config = {  
-    RedirectOnlyWhenRagdolled                 = false,  -- ADD THIS  
+		Config = {  
+    RedirectOnlyWhenRagdolled                 = false,  
     ShowTrajectoryArc                         = false,  
     ClearArcWhenIdle                          = true,  
     EnableKeywordHazardDetection              = true,  

@@ -1287,6 +1287,9 @@ end
 local function onHeartbeat(dt)
 	if not Controller.Enabled then return end
 	if not rootPart or not rootPart.Parent then return end
+	if #acidParts == 0 and os.clock() % 5 < 0.1 then
+	rebuildAcidParts()
+end
 
 	if safePathFound then
 		local age = os.clock() - safePathFoundAt
@@ -1359,7 +1362,10 @@ if LocalPlayer then
 	charRemovingConn = LocalPlayer.CharacterRemoving:Connect(onCharacterRemoving)
 end
 
-rebuildAcidParts()
+task.delay(2, function()
+	rebuildAcidParts()
+	print("[AR] acidParts loaded:", #acidParts)
+end)
 
 Controller.Start = function()
 	Controller.Enabled = true

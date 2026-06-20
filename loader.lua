@@ -649,7 +649,7 @@ local function startAcidRedirect()
 			end,
 
 		Config = {  
-    RedirectOnlyWhenRagdolled                 = false,  
+    RedirectOnlyWhenRagdolled                 = true,  
     ShowTrajectoryArc                         = false,  
     ClearArcWhenIdle                          = true,  
     EnableKeywordHazardDetection              = true,  

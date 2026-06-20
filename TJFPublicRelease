@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------
--- Trajectory Finder API (fixed)
+-- Trajectory Finder API (Optimized & Cleaned)
 -- Returns PredictPlayerLanding(playerObjectOrCharacter, options)
 --------------------------------------------------------------------------
 
@@ -45,16 +45,16 @@ local COLOR_SECONDARY = Color3.fromRGB(255, 190, 60)
 local COLOR_HIT       = Color3.fromRGB(255, 70,  70)
 local COLOR_END       = Color3.fromRGB(255, 0,   0)
 
+-- Part Pool to prevent massive GC lag from constant Neon part destruction/creation
+local activeVisualParts = {}
+local partPool = {}
+
 local function positive(v)
 	return typeof(v) == "number" and v > 0
 end
 
 local function mergeOptions(options)
-	local merged = {}
-
-	for k, v in pairs(DEFAULT_OPTIONS) do
-		merged[k] = v
-	end
+	local merged = table.clone(DEFAULT_OPTIONS)
 
 	if typeof(options) == "table" then
 		for k, v in pairs(options) do
@@ -170,10 +170,6 @@ local function getCastInfo(rootPart, character, options)
 	if typeof(options.CastSize) == "Vector3" then
 		size = options.CastSize
 	elseif character then
-		-- FIX: GetBoundingBox errors when called while the character model is
-		-- mid-removal (AncestryChanged fires before all children are gone, so
-		-- this window exists during normal respawn). Wrap and fall back to
-		-- rootPart.Size so the cast still has a reasonable shape.
 		local ok, boxCFrame, boxSize = pcall(function()
 			return character:GetBoundingBox()
 		end)
@@ -209,9 +205,9 @@ local function getDragAcceleration(velocity, mass, options)
 
 	if speed <= 0.001 then return Vector3.zero end
 
-	local airDensity       = typeof(options.AirDensity)       == "number" and options.AirDensity       or 0
-	local dragCoefficient  = typeof(options.DragCoefficient)  == "number" and options.DragCoefficient  or 0
-	local crossSectionArea = typeof(options.CrossSectionArea) == "number" and options.CrossSectionArea or 0
+	local airDensity       = options.AirDensity or 0
+	local dragCoefficient  = options.DragCoefficient or 0
+	local crossSectionArea = options.CrossSectionArea or 0
 
 	if airDensity <= 0 or dragCoefficient <= 0 or crossSectionArea <= 0 then
 		return Vector3.zero
@@ -226,7 +222,7 @@ local function getMagnusAcceleration(velocity, angularVelocity, options)
 		return Vector3.zero
 	end
 
-	local coefficient = typeof(options.MagnusCoefficient) == "number" and options.MagnusCoefficient or 0
+	local coefficient = options.MagnusCoefficient or 0
 
 	if coefficient <= 0 then return Vector3.zero end
 
@@ -238,39 +234,6 @@ local function getMagnusAcceleration(velocity, angularVelocity, options)
 	end
 
 	return magnus
-end
-
-local function safeSpherecast(position, radius, displacement, params)
-	local ok, result = pcall(function()
-		return Workspace:Spherecast(position, radius, displacement, params)
-	end)
-
-	if ok then return result end
-	return Workspace:Raycast(position, displacement, params)
-end
-
-local function safeBlockcast(cframe, size, displacement, params)
-	local ok, result = pcall(function()
-		return Workspace:Blockcast(cframe, size, displacement, params)
-	end)
-
-	if ok then return result end
-	return Workspace:Raycast(cframe.Position, displacement, params)
-end
-
-local function castPath(position, displacement, castInfo, params)
-	if displacement.Magnitude <= 0.001 then return nil end
-
-	if castInfo.Mode == "Ray" then
-		return Workspace:Raycast(position, displacement, params)
-	end
-
-	if castInfo.Mode == "Sphere" then
-		return safeSpherecast(position, castInfo.Radius, displacement, params)
-	end
-
-	local center = position + castInfo.Rotation:VectorToWorldSpace(castInfo.CenterOffset)
-	return safeBlockcast(CFrame.new(center) * castInfo.Rotation, castInfo.Size, displacement, params)
 end
 
 local function getArcFolder()
@@ -286,28 +249,28 @@ local function getArcFolder()
 end
 
 local function clearArc()
-	-- FIX: use ClearAllChildren() — cleaner than a manual GetChildren loop
-	-- and avoids any edge-case where a child is added between GetChildren and Destroy.
-	local folder = Workspace:FindFirstChild(ARC_FOLDER_NAME)
-	if folder then
-		folder:ClearAllChildren()
+	-- Recycle and hide active segments instead of blowing them away.
+	for _, part in ipairs(activeVisualParts) do
+		part.CFrame = CFrame.new(0, 50000, 0)
+		part.Transparency = 1
+		table.insert(partPool, part)
 	end
+	table.clear(activeVisualParts)
 end
 
-local function makeArcPart(name, size, color, transparency)
-	local part = Instance.new("Part")
-	part.Name          = name
-	part.Anchored      = true
-	part.CanCollide    = false
-	part.CanTouch      = false
-	part.CanQuery      = false
-	part.CastShadow    = false
-	part.Material      = Enum.Material.Neon
-	part.Color         = color
-	part.Transparency  = transparency
-	part.Size          = size
-	part.TopSurface    = Enum.SurfaceType.Smooth
-	part.BottomSurface = Enum.SurfaceType.Smooth
+local function getPooledPart()
+	local part = table.remove(partPool)
+	if not part or not part.Parent then
+		part = Instance.new("Part")
+		part.Anchored      = true
+		part.CanCollide    = false
+		part.CanTouch      = false
+		part.CanQuery      = false
+		part.CastShadow    = false
+		part.Material      = Enum.Material.Neon
+		part.TopSurface    = Enum.SurfaceType.Smooth
+		part.BottomSurface = Enum.SurfaceType.Smooth
+	end
 	return part
 end
 
@@ -351,16 +314,16 @@ local function drawPath(prediction, color, options, prefix)
 			local distance = (b - a).Magnitude
 
 			if distance > 0.001 then
-				local segment = makeArcPart(
-					prefix .. "_Path",
-					Vector3.new(thickness, distance, thickness),
-					color,
-					transparency
-				)
-
+				local segment = getPooledPart()
+				segment.Name  = prefix .. "_Path"
+				segment.Size  = Vector3.new(thickness, distance, thickness)
+				segment.Color = color
+				segment.Transparency = transparency
 				segment.Shape  = Enum.PartType.Cylinder
 				segment.CFrame = cylinderBetween(a, b)
 				segment.Parent = folder
+
+				table.insert(activeVisualParts, segment)
 			end
 		end
 	end
@@ -377,10 +340,16 @@ local function drawEndMarker(prediction)
 
 	if typeof(pos) ~= "Vector3" then return end
 
-	local marker = makeArcPart("EndMarker", Vector3.new(0.85, 0.85, 0.85), COLOR_END, 0.02)
-	marker.Shape  = Enum.PartType.Ball
-	marker.CFrame = CFrame.new(pos)
-	marker.Parent = getArcFolder()
+	local marker = getPooledPart()
+	marker.Name          = "EndMarker"
+	marker.Size          = Vector3.new(0.85, 0.85, 0.85)
+	marker.Color         = COLOR_END
+	marker.Transparency  = 0.02
+	marker.Shape         = Enum.PartType.Ball
+	marker.CFrame        = CFrame.new(pos)
+	marker.Parent        = getArcFolder()
+
+	table.insert(activeVisualParts, marker)
 end
 
 local function buildPrediction(character, rootPart, options, initialVelocity, initialAngularVelocity)
@@ -392,13 +361,34 @@ local function buildPrediction(character, rootPart, options, initialVelocity, in
 	local params          = buildParams(character, options)
 	local castInfo        = getCastInfo(rootPart, character, options)
 
-	local trajectory = { position }
+	-- Pre-allocate arrays utilizing step budgets to optimize Luau memory indexing.
+	local maxSteps        = math.ceil(options.MaxTime / options.TimeStep)
+	local trajectory      = table.create(maxSteps + 1)
+	table.insert(trajectory, position)
+	
 	local elapsed    = 0
 
+	-- Pre-resolve the spherecast/blockcast runtime options once outside our loop.
+	local castFunc
+	if castInfo.Mode == "Ray" then
+		castFunc = function(pos, disp)
+			return Workspace:Raycast(pos, disp, params)
+		end
+	elseif castInfo.Mode == "Sphere" then
+		castFunc = function(pos, disp)
+			return Workspace:Spherecast(pos, castInfo.Radius, disp, params)
+		end
+	else -- "Block" default
+		local rotation = castInfo.Rotation
+		local size = castInfo.Size
+		local offset = castInfo.CenterOffset
+		castFunc = function(pos, disp)
+			local center = pos + rotation:VectorToWorldSpace(offset)
+			return Workspace:Blockcast(CFrame.new(center) * rotation, size, disp, params)
+		end
+	end
+
 	while elapsed < options.MaxTime do
-		-- FIX: if the character is removed while a long-horizon prediction is
-		-- running (e.g. MaxTime = 5 at 60 Hz = 300 casts), bail out rather
-		-- than continuing to cast against a world the character no longer occupies.
 		if not rootPart.Parent then
 			break
 		end
@@ -412,7 +402,12 @@ local function buildPrediction(character, rootPart, options, initialVelocity, in
 		local nextPosition = position + velocity * step + 0.5 * acceleration * step * step
 		local displacement = nextPosition - position
 
-		local hitResult = castPath(position, displacement, castInfo, params)
+		-- Direct cast execution without runtime pcall-wrapping inside simulation.
+		local ok, hitResult = pcall(castFunc, position, displacement)
+		if not ok then
+			-- Fallback to standard raycast if hardware streaming or client constraints drop execution context
+			hitResult = Workspace:Raycast(position, displacement, params)
+		end
 
 		if hitResult then
 			local alpha          = math.clamp(
@@ -535,8 +530,6 @@ local function PredictPlayerLanding(playerOrCharacter, options)
 	local character = getCharacter(playerOrCharacter)
 	local rootPart  = getRootPart(character)
 
-	-- FIX: also guard rootPart.Parent — the part can exist but be unparented
-	-- during the brief window between character removal and GC.
 	if not rootPart or not rootPart:IsA("BasePart") or not rootPart.Parent then
 		return returnPrediction({
 			Trajectory   = {},

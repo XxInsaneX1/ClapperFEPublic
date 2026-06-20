@@ -1095,7 +1095,8 @@ local function simulateCandidateSafe(startPos, candidateVel)
 
 		simulatedVel += acc * step
 
-		local nextPos = simulatedPos + simulatedVel * step
+		local nextPos = simulatedPos + simulatedVel * step + 0.5 * acc * step * step
+		simulatedVel = simulatedVel + acc * step
 
 		if getAcidNearPoint(nextPos, CONFIG.TrajectoryAcidRadius) then
 			return false

@@ -33,8 +33,8 @@ end
 local CONFIG = {
 	Enabled = true,
 
-	EnableNotifications    = true,
-	NotificationCooldown   = 1.75,
+	EnableNotifications  = true,
+	NotificationCooldown = 1.75,
 
 	EnableKeywordHazardDetection = true,
 	EnableBroadHazardScan        = true,
@@ -47,22 +47,22 @@ local CONFIG = {
 		"poison", "lava", "void", "hazard", "danger", "abnormality",
 	},
 
-	ShowTrajectoryArc       = true,
-	ClearArcWhenIdle        = true,
-	ArcFolderName           = "__AcidRedirectTrajectoryArc",
-	ArcVisualStride         = 1,
-	ArcThickness            = 0.12,
-	ArcLandingMarkerSize    = 0.85,
-	ArcSafeColor            = Color3.fromRGB(0, 255, 180),
-	ArcDangerColor          = Color3.fromRGB(255, 70, 70),
-	ArcEndMarkerColor       = Color3.fromRGB(255, 0, 0),
-	ArcTransparency         = 0.08,
-	ArcMaterial             = Enum.Material.Neon,
+	ShowTrajectoryArc    = true,
+	ClearArcWhenIdle     = true,
+	ArcFolderName        = "__AcidRedirectTrajectoryArc",
+	ArcVisualStride      = 1,
+	ArcThickness         = 0.12,
+	ArcLandingMarkerSize = 0.85,
+	ArcSafeColor         = Color3.fromRGB(0, 255, 180),
+	ArcDangerColor       = Color3.fromRGB(255, 70, 70),
+	ArcEndMarkerColor    = Color3.fromRGB(255, 0, 0),
+	ArcTransparency      = 0.08,
+	ArcMaterial          = Enum.Material.Neon,
 
-	PredictEvery          = 0.12,
-	ApplyWindow           = 0.38,
-	MinSpeedToPredict     = 8,
-	ActivationDistance    = 230,
+	PredictEvery       = 0.12,
+	ApplyWindow        = 0.38,
+	MinSpeedToPredict  = 8,
+	ActivationDistance = 230,
 
 	PredictionMaxTime      = 1.85,
 	PredictionTimeStep     = 1 / 40,
@@ -81,41 +81,44 @@ local CONFIG = {
 	EnableRagdollSlidePrediction          = true,
 	EnableStandingVelocitySlidePrediction = true,
 
-	SlideLookahead               = 1.5,
-	SlideTimeStep                = 1 / 12,
-	SlideDangerRadius            = 3.25,
-	SlideProbeRadius             = 1.8,
-	SlideProbeHeight             = 4,
-	SlideSurfaceOffset           = 0.2,
-	MinSlideSpeed                = 3.5,
-	MinStandingSlideSpeed        = 4.5,
+	SlideLookahead                  = 1.5,
+	SlideTimeStep                   = 1 / 12,
+	SlideDangerRadius               = 3.25,
+	SlideProbeRadius                = 1.8,
+	SlideProbeHeight                = 4,
+	SlideSurfaceOffset              = 0.2,
+	MinSlideSpeed                   = 3.5,
+	MinStandingSlideSpeed           = 4.5,
 	StandingSlideVelocityMultiplier = 1,
-	MaxSlideSpeed                = 78,
-	DefaultSurfaceFriction       = 0.45,
-	StaticFrictionMultiplier     = 1.15,
-	RagdollFrictionMultiplier    = 0.55,
-	StandingFrictionMultiplier   = 1.2,
+	MaxSlideSpeed                   = 78,
+	DefaultSurfaceFriction          = 0.45,
+	StaticFrictionMultiplier        = 1.15,
+	RagdollFrictionMultiplier       = 0.55,
+	StandingFrictionMultiplier      = 1.2,
 
-	RedirectResponsiveness    = 16,
-	RedirectHorizontalSpeed   = 48,
+	RedirectResponsiveness     = 16,
+	RedirectHorizontalSpeed    = 48,
 	RedirectMaxHorizontalSpeed = 92,
-	RedirectLift              = 26,
-	SlideRedirectLift         = 16,
-	SideBias                  = 0.32,
+	RedirectLift               = 26,
+	SlideRedirectLift          = 16,
+	SideBias                   = 0.32,
 
-	EmergencyRedirectTime      = 0.55,
-	EmergencyRedirectDistance  = 28,
-	EmergencyRedirectAlpha     = 1,
-	NormalRedirectMinAlpha     = 0.35,
+	EmergencyRedirectTime     = 0.55,
+	EmergencyRedirectDistance = 28,
+	EmergencyRedirectAlpha    = 1,
+	NormalRedirectMinAlpha    = 0.35,
 
-	ImpulseAssist      = true,
-	ImpulseMultiplier  = 1.15,
+	ImpulseAssist     = true,
+	ImpulseMultiplier = 1.15,
 
-	-- FIX (new requirement): redirect only fires when ragdolled OR when the
-	-- player's horizontal speed exceeds WalkSpeed * this multiplier.
-	-- Default of 1.0 matches AntiFling's default HorizontalMultiplier = 1,
-	-- meaning anything above normal walk speed is considered a fling.
+	-- Redirect fires only when ragdolled OR horizontal speed exceeds
+	-- WalkSpeed * RedirectMinSpeedMultiplier.
 	RedirectMinSpeedMultiplier = 1.0,
+
+	-- FIX: flat studs/s buffer added on top of the WalkSpeed threshold so
+	-- Roblox physics jitter (e.g. 16.003 at WalkSpeed 16) cannot accidentally
+	-- cross the threshold during normal locomotion and trigger a redirect.
+	RedirectSpeedBuffer = 2,
 }
 
 if typeof(loaderOptions.ShowTrajectoryArc) == "boolean" then
@@ -149,11 +152,6 @@ local function notifyHazardThrottled(key, message, duration)
 	notifyHazard(message, duration)
 end
 
--- FIX: removed assert(map, "Map folder not found"). WaitForChild with a timeout
--- returns nil instead of erroring; assert would kill the entire script if the
--- map isn't loaded in time. All subsequent lookups are nil-guarded so the
--- redirect degrades gracefully (keyword detection still runs, direct-hit
--- detection falls back to an empty folder).
 local map = Workspace:WaitForChild("Map", 10)
 
 local acidAbnormality = map and map:FindFirstChild("AcidAbnormality") or nil
@@ -166,11 +164,11 @@ if not acidPitFolder then
 end
 
 local Controller = {
-	Enabled                   = CONFIG.Enabled,
-	Config                    = CONFIG,
-	LastDanger                = nil,
-	LastPrediction            = nil,
-	LastError                 = nil,
+	Enabled                    = CONFIG.Enabled,
+	Config                     = CONFIG,
+	LastDanger                 = nil,
+	LastPrediction             = nil,
+	LastError                  = nil,
 	UsingExternalTrajectoryApi = ExternalPredictPlayerLanding ~= nil,
 }
 
@@ -178,8 +176,8 @@ local character
 local humanoid
 local rootPart
 
-local raycastParams           = RaycastParams.new()
-local acidOverlapParams       = OverlapParams.new()
+local raycastParams            = RaycastParams.new()
+local acidOverlapParams        = OverlapParams.new()
 local broadHazardOverlapParams = OverlapParams.new()
 
 local acidParts   = {}
@@ -187,22 +185,22 @@ local acidPartSet = {}
 local connections = {}
 local heartbeatConnection = nil
 
-local accumulated            = 0
-local nearestAcidDistance    = math.huge
+local accumulated             = 0
+local nearestAcidDistance     = math.huge
 local nearestCheckAccumulated = 0
-local lastDangerUntil        = 0
-local overlapSupported       = true
+local lastDangerUntil         = 0
+local overlapSupported        = true
 
-raycastParams.FilterType   = Enum.RaycastFilterType.Exclude
-raycastParams.IgnoreWater  = true
+raycastParams.FilterType  = Enum.RaycastFilterType.Exclude
+raycastParams.IgnoreWater = true
 
-acidOverlapParams.FilterType                   = Enum.RaycastFilterType.Include
-acidOverlapParams.FilterDescendantsInstances   = { acidPitFolder }
-acidOverlapParams.RespectCanCollide            = false
+acidOverlapParams.FilterType                 = Enum.RaycastFilterType.Include
+acidOverlapParams.FilterDescendantsInstances = { acidPitFolder }
+acidOverlapParams.RespectCanCollide          = false
 
-broadHazardOverlapParams.FilterType                   = Enum.RaycastFilterType.Exclude
-broadHazardOverlapParams.FilterDescendantsInstances   = {}
-broadHazardOverlapParams.RespectCanCollide            = false
+broadHazardOverlapParams.FilterType                 = Enum.RaycastFilterType.Exclude
+broadHazardOverlapParams.FilterDescendantsInstances = {}
+broadHazardOverlapParams.RespectCanCollide          = false
 
 local function clearArray(array)
 	for index = #array, 1, -1 do
@@ -223,7 +221,6 @@ local function getArcFolder()
 end
 
 local function clearTrajectoryArc()
-	-- FIX: use ClearAllChildren() instead of a manual GetChildren loop.
 	local folder = Workspace:FindFirstChild(CONFIG.ArcFolderName)
 	if folder then
 		folder:ClearAllChildren()
@@ -473,14 +470,14 @@ end
 local function updateRaycastParams()
 	local exclude = if character then { character } else {}
 
-	raycastParams.FilterDescendantsInstances           = exclude
+	raycastParams.FilterDescendantsInstances            = exclude
 	broadHazardOverlapParams.FilterDescendantsInstances = exclude
 end
 
 local function setupCharacter(nextCharacter)
-	character  = nextCharacter
-	humanoid   = nextCharacter and nextCharacter:FindFirstChildOfClass("Humanoid") or nil
-	rootPart   = getRootPart(nextCharacter)
+	character = nextCharacter
+	humanoid  = nextCharacter and nextCharacter:FindFirstChildOfClass("Humanoid") or nil
+	rootPart  = getRootPart(nextCharacter)
 	updateRaycastParams()
 end
 
@@ -555,7 +552,13 @@ local function getNearestAcidDistance(position)
 		end
 	end
 
-	return nearest < math.huge and nearest or 0
+	-- FIX: was returning 0 when acidParts is empty (fallback folder case).
+	-- Returning 0 made nearestAcidDistance always <= ActivationDistance,
+	-- causing the script to think the player was always at the acid pit and
+	-- run prediction + redirect logic everywhere in the map.
+	-- Now returns math.huge when no parts are found, which correctly causes
+	-- shouldPredict() to early-return false until real acid parts load in.
+	return nearest
 end
 
 local function getHorizontal(vector)
@@ -616,14 +619,14 @@ local function predictTrajectoryInternal()
 		stepIndex += 1
 
 		local step         = math.min(CONFIG.PredictionTimeStep, CONFIG.PredictionMaxTime - elapsed)
-		local acceleration = gravity + getDragAcceleration(velocity) + getMagnusAcceleration(velocity, angularVelocity)
+		local acceleration = gravity
+			+ getDragAcceleration(velocity)
+			+ getMagnusAcceleration(velocity, angularVelocity)
 		local nextVelocity = velocity + acceleration * step
 		local nextPosition = position + velocity * step + 0.5 * acceleration * step * step
 		local displacement = nextPosition - position
 
 		if displacement.Magnitude > 0.001 then
-			-- FIX: Spherecast unprotected in original; if new API surface isn't
-			-- available or params are invalid, this would kill the prediction loop.
 			local hitResult
 			local castOk, castResult = pcall(function()
 				return Workspace:Spherecast(position, CONFIG.CharacterRadius, displacement, raycastParams)
@@ -636,8 +639,8 @@ local function predictTrajectoryInternal()
 			end
 
 			if hitResult then
-				local alpha          = math.clamp(hitResult.Distance / displacement.Magnitude, 0, 1)
-				local rootPosition   = position:Lerp(nextPosition, alpha)
+				local alpha        = math.clamp(hitResult.Distance / displacement.Magnitude, 0, 1)
+				local rootPosition = position:Lerp(nextPosition, alpha)
 
 				table.insert(trajectory, rootPosition)
 
@@ -662,22 +665,22 @@ local function predictTrajectoryInternal()
 
 			if dangerPart then
 				return {
-					Trajectory    = trajectory,
-					HitResult     = nil,
-					HitPart       = dangerPart,
-					LandPosition  = nextPosition,
-					RootPosition  = nextPosition,
-					Time          = elapsed + step,
-					Velocity      = nextVelocity,
+					Trajectory     = trajectory,
+					HitResult      = nil,
+					HitPart        = dangerPart,
+					LandPosition   = nextPosition,
+					RootPosition   = nextPosition,
+					Time           = elapsed + step,
+					Velocity       = nextVelocity,
 					NearDangerPart = dangerPart,
-					Source        = "Internal",
+					Source         = "Internal",
 				}
 			end
 		end
 
-		position  = nextPosition
-		velocity  = nextVelocity
-		elapsed  += step
+		position = nextPosition
+		velocity = nextVelocity
+		elapsed += step
 	end
 
 	return {
@@ -756,10 +759,9 @@ local function getSurfaceFriction(part)
 end
 
 local function getGroundHit(position)
-	local origin      = position + Vector3.new(0, CONFIG.SlideProbeHeight * 0.5, 0)
+	local origin       = position + Vector3.new(0, CONFIG.SlideProbeHeight * 0.5, 0)
 	local displacement = Vector3.new(0, -CONFIG.SlideProbeHeight, 0)
 
-	-- FIX: protect Spherecast with pcall; fall back to Raycast.
 	local ok, result = pcall(function()
 		return Workspace:Spherecast(origin, CONFIG.SlideProbeRadius, displacement, raycastParams)
 	end)
@@ -772,8 +774,8 @@ local function simulateSlideDanger(prediction)
 	if not CONFIG.EnableSlidePrediction then return nil end
 	if not prediction then return nil end
 
-	local hitResult  = prediction.HitResult
-	local groundHit  = hitResult
+	local hitResult = prediction.HitResult
+	local groundHit = hitResult
 
 	if not groundHit then
 		groundHit = getGroundHit(
@@ -809,16 +811,16 @@ local function simulateSlideDanger(prediction)
 	if normal.Y <= 0.05 then return nil end
 
 	while elapsed < CONFIG.SlideLookahead do
-		local step             = math.min(CONFIG.SlideTimeStep, CONFIG.SlideLookahead - elapsed)
-		local gravity          = Vector3.new(0, -Workspace.Gravity, 0)
-		local slopeAcceleration = gravity - normal * gravity:Dot(normal)
+		local step               = math.min(CONFIG.SlideTimeStep, CONFIG.SlideLookahead - elapsed)
+		local gravity            = Vector3.new(0, -Workspace.Gravity, 0)
+		local slopeAcceleration  = gravity - normal * gravity:Dot(normal)
 		local normalAcceleration = math.max(-gravity:Dot(normal), 0)
-		local surfaceFriction   = getSurfaceFriction(groundHit.Instance)
+		local surfaceFriction    = getSurfaceFriction(groundHit.Instance)
 		local frictionMultiplier = if ragdoll
 			then CONFIG.RagdollFrictionMultiplier
 			else CONFIG.StandingFrictionMultiplier
-		local kineticFriction   = surfaceFriction * frictionMultiplier
-		local staticFriction    = kineticFriction * CONFIG.StaticFrictionMultiplier
+		local kineticFriction       = surfaceFriction * frictionMultiplier
+		local staticFriction        = kineticFriction * CONFIG.StaticFrictionMultiplier
 		local minRequiredSlideSpeed = ragdoll
 			and CONFIG.MinSlideSpeed
 			or CONFIG.MinStandingSlideSpeed
@@ -975,8 +977,8 @@ local function getEscapeDirectionFromPart(part, worldPoint)
 	local distances = {
 		{ Distance = math.abs(halfSize.X  - localPoint.X), Direction = Vector3.new( 1, 0, 0) },
 		{ Distance = math.abs(-halfSize.X - localPoint.X), Direction = Vector3.new(-1, 0, 0) },
-		{ Distance = math.abs(halfSize.Z  - localPoint.Z), Direction = Vector3.new( 0, 0, 1) },
-		{ Distance = math.abs(-halfSize.Z - localPoint.Z), Direction = Vector3.new( 0, 0,-1) },
+		{ Distance = math.abs(halfSize.Z  - localPoint.Z), Direction = Vector3.new( 0, 0,  1) },
+		{ Distance = math.abs(-halfSize.Z - localPoint.Z), Direction = Vector3.new( 0, 0, -1) },
 	}
 
 	table.sort(distances, function(a, b) return a.Distance < b.Distance end)
@@ -1017,9 +1019,9 @@ local function getDangerTime(danger)
 end
 
 local function getSafeVelocity(danger)
-	local currentVelocity    = rootPart.AssemblyLinearVelocity
-	local currentHorizontal  = getHorizontal(currentVelocity)
-	local desiredDirection   = nil
+	local currentVelocity   = rootPart.AssemblyLinearVelocity
+	local currentHorizontal = getHorizontal(currentVelocity)
+	local desiredDirection  = nil
 
 	if danger.Part and danger.Part:IsA("BasePart") then
 		desiredDirection = getEscapeDirectionFromPart(danger.Part, rootPart.Position)
@@ -1063,7 +1065,9 @@ local function getSafeVelocity(danger)
 	local emergency      = dangerDistance <= CONFIG.EmergencyRedirectDistance
 		or dangerTime <= CONFIG.EmergencyRedirectTime
 
-	local minSpeed = emergency and CONFIG.RedirectMaxHorizontalSpeed or CONFIG.RedirectHorizontalSpeed
+	local minSpeed = emergency
+		and CONFIG.RedirectMaxHorizontalSpeed
+		or CONFIG.RedirectHorizontalSpeed
 
 	local horizontalSpeed = math.clamp(
 		math.max(currentHorizontal.Magnitude, minSpeed),
@@ -1071,7 +1075,9 @@ local function getSafeVelocity(danger)
 		CONFIG.RedirectMaxHorizontalSpeed
 	)
 
-	local lift = if string.find(danger.Kind, "Slide") then CONFIG.SlideRedirectLift else CONFIG.RedirectLift
+	local lift = if string.find(danger.Kind, "Slide")
+		then CONFIG.SlideRedirectLift
+		else CONFIG.RedirectLift
 
 	if emergency then
 		lift = math.max(lift, CONFIG.RedirectLift + 8)
@@ -1086,14 +1092,16 @@ local function getSafeVelocity(danger)
 	return desiredDirection * horizontalSpeed + Vector3.new(0, targetY, 0)
 end
 
--- FIX (new requirement): only apply the velocity redirect when the player is
--- ragdolled OR when their horizontal speed is above the AntiFling trigger
--- threshold (WalkSpeed * RedirectMinSpeedMultiplier, default 1.0).
+-- Redirect only fires when:
+--   (a) the player is ragdolled, OR
+--   (b) horizontal speed exceeds WalkSpeed * RedirectMinSpeedMultiplier
+--       plus a flat buffer (RedirectSpeedBuffer studs/s) that absorbs
+--       Roblox physics jitter so normal walking never crosses the threshold.
 --
--- This prevents the redirect from fighting normal locomotion — e.g. a player
--- walking along the edge of the acid pit will still have their trajectory
--- highlighted, but the velocity override will not fire unless they are either
--- in a ragdoll state or have been flung past normal walk speed.
+-- Example with defaults (WalkSpeed 16, multiplier 1.0, buffer 2):
+--   threshold = 16 * 1.0 + 2 = 18 studs/s
+--   Normal walking peaks at ~16 → never fires.
+--   A fling typically sends the player to 60-200 studs/s → always fires.
 local function canApplyRedirect()
 	if not humanoid or not rootPart or not rootPart.Parent then
 		return false
@@ -1105,6 +1113,7 @@ local function canApplyRedirect()
 
 	local horizontalSpeed = getHorizontal(rootPart.AssemblyLinearVelocity).Magnitude
 	local threshold       = humanoid.WalkSpeed * CONFIG.RedirectMinSpeedMultiplier
+		+ CONFIG.RedirectSpeedBuffer
 
 	return horizontalSpeed > threshold
 end
@@ -1141,7 +1150,9 @@ local function applyRedirect(deltaTime)
 
 		if deltaVelocity.Magnitude > 0.001 then
 			pcall(function()
-				rootPart:ApplyImpulse(deltaVelocity * rootPart.AssemblyMass * CONFIG.ImpulseMultiplier)
+				rootPart:ApplyImpulse(
+					deltaVelocity * rootPart.AssemblyMass * CONFIG.ImpulseMultiplier
+				)
 			end)
 		end
 	end
@@ -1150,6 +1161,9 @@ end
 local function shouldPredict()
 	if not rootPart or not rootPart.Parent then return false end
 
+	-- nearestAcidDistance is now math.huge when no acid parts exist (fallback
+	-- folder is empty), so this correctly short-circuits the whole function
+	-- instead of falling through as if the player is at the pit.
 	if nearestAcidDistance > CONFIG.ActivationDistance then return false end
 
 	local velocity           = rootPart.AssemblyLinearVelocity
@@ -1214,7 +1228,11 @@ local function onHeartbeat(deltaTime)
 
 			if danger then
 				if not Controller.LastDanger then
-					notifyHazardThrottled("trajectory_detected", "Trajectory detected toward acid", 2.5)
+					notifyHazardThrottled(
+						"trajectory_detected",
+						"Trajectory detected toward acid",
+						2.5
+					)
 				end
 
 				Controller.LastDanger = danger
@@ -1241,10 +1259,6 @@ local function onHeartbeat(deltaTime)
 		end
 	end
 
-	-- FIX (new requirement): only apply the redirect if the player is ragdolled
-	-- or moving faster than the AntiFling horizontal threshold. Detection,
-	-- arc drawing, and the LastDanger window are unaffected — only the actual
-	-- velocity override is gated here.
 	if Controller.LastDanger and os.clock() <= lastDangerUntil then
 		if canApplyRedirect() then
 			applyRedirect(deltaTime)
@@ -1258,11 +1272,11 @@ function Controller.Start()
 end
 
 function Controller.Stop()
-	Controller.Enabled    = false
-	CONFIG.Enabled        = false
-	Controller.LastDanger = nil
+	Controller.Enabled        = false
+	CONFIG.Enabled            = false
+	Controller.LastDanger     = nil
 	Controller.LastPrediction = nil
-	lastDangerUntil       = 0
+	lastDangerUntil           = 0
 
 	if CONFIG.ClearArcWhenIdle then
 		clearTrajectoryArc()

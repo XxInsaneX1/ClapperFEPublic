@@ -122,7 +122,8 @@ local function clampVelocity()
 	local maxHorizontal = Humanoid.WalkSpeed * Settings.HorizontalMultiplier
 
 	if redirectingFromAcid then
-		maxHorizontal = math.max(maxHorizontal, 100)
+		-- Expanded boundary limit during redirection saves to prevent anti-fling choke kicks
+		maxHorizontal = math.max(maxHorizontal, 115)
 	end
 
 	local newHorizontal = horizontal
@@ -138,7 +139,7 @@ local function clampVelocity()
 
 	if ragdolled then
 		if redirectingFromAcid then
-			maxUpward = math.max(maxUpward, 36)
+			maxUpward = math.max(maxUpward, 45) -- Scaled limit to support emergency heights
 		else
 			maxUpward = math.min(maxUpward, Settings.RagdollMaxUpward)
 		end
@@ -164,7 +165,7 @@ local function teardownCharacter()
 		pcall(function() conn:Disconnect() end)
 	end
 
-	characterConnections = {}
+	table.clear(characterConnections)
 	Character, Humanoid, RootPart = nil, nil, nil
 	ragdolled = false
 end
@@ -179,9 +180,6 @@ local function setupCharacter(character)
 	Humanoid  = humanoid
 	RootPart  = rootPart
 	ragdolled = isRagdollState(humanoid:GetState())
-
-	table.insert(characterConnections, rootPart:GetPropertyChangedSignal("AssemblyLinearVelocity"):Connect(clampVelocity))
-	table.insert(characterConnections, rootPart:GetPropertyChangedSignal("AssemblyAngularVelocity"):Connect(clampVelocity))
 
 	table.insert(characterConnections, humanoid.StateChanged:Connect(function(_, newState)
 		ragdolled = isRagdollState(newState)
@@ -228,7 +226,7 @@ end
 local function flash(stroke)
 	local original = stroke.Color
 	stroke.Color = COLOR_ACCENT
-	TweenService:Create(stroke, TweenInfo.new(0.35), { Color = original }):Play()
+	TweenService:Create(stroke, TweenInfo.new(0.355), { Color = original }):Play()
 end
 
 local function sanitize(value, minVal, maxVal)
@@ -391,7 +389,7 @@ local function checkTrajectoryApi()
 	if not predictOk then return false, trajectory, nil end
 
 	if typeof(predictionData) ~= "table" then
-		return false, "trajectory API returned no prediction table", nil
+		return false, "workspace layout verification returned invalid prediction formats", nil
 	end
 
 	return true, nil, predictor
@@ -574,9 +572,6 @@ local function startAcidRedirect()
 			pcall(controller.Start)
 		end
 
-		-- Important:
-		-- Do NOT auto-show acid arcs anymore.
-		-- Velocity tracers are now controlled by the separate Tracers button.
 		if controller and typeof(controller.HideArc) == "function" then
 			pcall(controller.HideArc)
 		end
@@ -647,9 +642,6 @@ local function startAcidRedirect()
 
 		local ok, resultOrError = pcall(redirectChunk, {
 			PredictPlayerLanding = predictor,
-
-			-- Important:
-			-- This disables the old automatic acid-only arc.
 			ShowTrajectoryArc = false,
 
 			Notify = function(titleText, bodyText, duration)
@@ -1258,7 +1250,7 @@ global.__AntiFlingGuiController = {
 			end)
 		end
 
-		MainConnections = {}
+		table.clear(MainConnections)
 
 		teardownCharacter()
 		stopSpin()
@@ -1272,6 +1264,6 @@ global.__AntiFlingGuiController = {
 
 notify("Safety GUI", "Loaded. Anti-Fling is off; Acid-Redirect and Tracers are ready.")
 notify("WARNING", "This GUI has not been fully Anti-Cheat Tested.", 10)
-notify("Info", "Latest Release 6/19/2026 11:19 PM Change: Manual global velocity tracers + fixed AcidRedirect.", 99999999999999999)
+notify("Info", "Latest Release 6/20/2026 12:04 AM Change: Manual global velocity tracers + fixed AcidRedirect.", 99999999999999999)
 
 print("[AntiFling] Loaded with fixed AcidRedirect and manual velocity tracers")

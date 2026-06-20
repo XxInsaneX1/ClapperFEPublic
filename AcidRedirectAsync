@@ -1093,9 +1093,7 @@ local function simulateCandidateSafe(startPos, candidateVel)
 		local step = math.min(CONFIG.SafePathSweepTimeStep, CONFIG.SafePathSweepMaxTime - elapsed)
 		local acc = Vector3.new(0, -Workspace.Gravity, 0) + getDragAcceleration(simulatedVel)
 
-		simulatedVel += acc * step
-
-		local nextPos = simulatedPos + simulatedVel * step + 0.5 * acc * step * step
+	local nextPos = simulatedPos + simulatedVel * step + 0.5 * acc * step * step
 		simulatedVel = simulatedVel + acc * step
 
 		if getAcidNearPoint(nextPos, CONFIG.TrajectoryAcidRadius) then
